@@ -14,21 +14,32 @@ segmentation mask used as the training target.
 ```
 lateral_detection/
 ├── configs/
-│   └── base.yaml                       # paths, polyline + rasterize params
+│   ├── base.yaml                       # paths, polyline + rasterize params
+│   └── train.yaml                      # model, loss, optimizer, schedule
 ├── credentials/                        # GCP service-account JSON (gitignored)
 │   └── inference-428300-7af7f5da75dc.json
 ├── data/
 │   ├── coco_loader.py                  # parse COCO export → ImageRecord + Chord
 │   ├── polyline_builder.py             # chords → polylines (endpoint merging)
-│   └── rasterize.py                    # polylines → binary mask
+│   ├── rasterize.py                    # polylines → binary mask
+│   ├── augmentation.py                 # flips + 90° rotations (line-safe)
+│   └── dataset.py                      # tile-based PyTorch Dataset + collate
+├── models/
+│   └── unet.py                         # smp.Unet baseline + DeepUNet two-stream
+├── training/
+│   ├── losses.py                       # BCE+Dice and Focal+Dice
+│   └── trainer.py                      # PyTorch train/val loop + viz + ckpt
 ├── symbols/
 │   └── call_symbol_localizer.py        # Vertex AI client: symbol localization + classification
 ├── notebooks/
-│   ├── 01_explore_labels.ipynb         # visual sanity-check of the dataset
-│   └── 02_symbol_detection_demo.ipynb  # smoke-test the symbol localizer endpoint
+│   ├── 01_explore_labels.ipynb         # dataset / polyline / mask visual check
+│   ├── 02_symbol_detection_demo.ipynb  # symbol localizer endpoint smoke-test
+│   └── 03_inspect_training_tile.ipynb  # one-pass training-tile sanity check
 ├── results/                            # (gitignored) outputs
 │   ├── data_debug/                     #   rendered label overlays
 │   └── symbols/                        #   cached symbol-endpoint responses
+├── runs/                               # (gitignored) training runs land here
+├── train.py                            # CLI entrypoint for training
 ├── requirements.txt
 └── README.md
 ```
@@ -55,6 +66,39 @@ nbstripout --install
 > still says "command not found" after activation, verify the venv exists
 > with `ls .venv/bin/`.
 
+### Deploying to a Linux GPU server
+
+The codebase is portable: every path is built with `pathlib.Path`, no absolute
+paths anywhere, line-ending agnostic. Two server-specific tips:
+
+```bash
+# 1) Install a CUDA-enabled PyTorch wheel BEFORE the rest. Pick the cu121 /
+#    cu124 / etc. index URL that matches your driver:
+#    https://pytorch.org/get-started/locally/
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements.txt
+
+# 2) Bump DataLoader workers for the box's CPU count
+#    (edit configs/train.yaml: training.num_workers).
+```
+
+Directory layout on the server must mirror local — `datasets/` sits *next to*
+`lateral_detection/`, since `configs/base.yaml` uses the relative path
+`../datasets/keypoints.v56-lat_only_baseline.coco`:
+
+```
+<some-parent>/
+├── datasets/
+│   └── keypoints.v56-lat_only_baseline.coco/...
+└── lateral_detection/
+    ├── train.py
+    ...
+```
+
+If you want a different absolute layout on the server, override
+`data.dataset_root` in `configs/train.yaml` (a fully-qualified `/data/...`
+path works fine — the loader treats it as absolute when it starts with `/`).
+
 ## Credentials (for the symbol localizer endpoint)
 
 The symbol-localizer client needs a GCP service-account JSON. The expected location is:
@@ -75,6 +119,39 @@ python -m symbols.call_symbol_localizer \
 ```
 
 For exploration, open `notebooks/02_symbol_detection_demo.ipynb` — it caches the raw responses under `results/symbols/<split>_id<NNN>/` so you don't pay for the call twice.
+
+## Training
+
+Inspect first, then train:
+
+```bash
+# 1. Sanity check what the trainer is about to see (image+mask tiles).
+jupyter lab notebooks/03_inspect_training_tile.ipynb
+
+# 2. Kick off training. Uses configs/base.yaml + configs/train.yaml.
+python train.py
+# or override defaults on the command line:
+python train.py --device cuda:0 --save-dir runs/v1_resnet34_bcedice
+```
+
+Outputs land under `runs/<save_dir>/`:
+
+| File | Contents |
+|---|---|
+| `best.pth` | Model state dict at the epoch with the highest val Dice |
+| `last.pth` | Most recent epoch's state dict |
+| `history.json` | Per-epoch losses + metrics |
+| `history.png` | Loss and metric curves |
+| `val_viz/epoch###_sample##.jpg` | Image / GT / pred / probability heatmap, per epoch |
+
+Most knobs you'd tweak live in `configs/train.yaml`:
+
+- **`model.encoder`** — swap `resnet34` for `resnet50` etc. for more capacity.
+- **`loss.name`** — `bce_dice` (default) or `focal_dice`.
+- **`loss.bce_pos_weight`** — bump above 1.0 if Dice alone undershoots.
+- **`data.train_mode`** — `random` (positive-centered, default) or
+  `pos_only_grid` (deterministic).
+- **`augmentation.*_prob`** — turn flips/rotations on/off.
 
 ## Exploring the dataset
 

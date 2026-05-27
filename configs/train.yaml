@@ -1,0 +1,44 @@
+# Training-specific config. Merged on top of configs/base.yaml at runtime
+# (train.py performs a shallow dict merge — keys here override base.yaml).
+
+model:
+  name: smp_unet                  # smp_unet | deep_unet
+  encoder: resnet34               # smp encoder name
+  encoder_weights: imagenet       # imagenet | null
+
+data:
+  tile_size: 1024
+  stride:    768                  # used by grid / pos_only_grid modes
+  train_mode: random              # random | grid | pos_only_grid
+  val_mode:   pos_only_grid       # grid | pos_only_grid
+  samples_per_epoch_per_image: 8  # for `random` mode
+
+augmentation:
+  enabled: true
+  hflip_prob:     0.5
+  vflip_prob:     0.5
+  rotate_90_prob: 0.5             # k * 90 degrees, k in {1, 2, 3}
+
+normalization:                    # ImageNet stats (we use ImageNet-pretrained ResNets)
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+
+loss:
+  name: bce_dice                  # bce_dice | focal_dice
+  bce_pos_weight: 1.0             # 1.0 = no extra positive weighting; Dice carries imbalance
+  dice_weight:    1.0
+  focal_alpha:    0.25            # used only when name == focal_dice
+  focal_gamma:    2.0
+
+training:
+  batch_size:  4
+  num_workers: 4
+  epochs:      80
+  lr:          1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip:   1.0
+  device:      cuda               # cuda | cuda:0 | cpu | mps
+  save_dir:    runs/v1_resnet34_bcedice
+  log_interval: 20
+  val_viz_count: 4
+  best_metric: dice               # dice | loss
