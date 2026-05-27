@@ -34,8 +34,12 @@ pyyaml>=6.0
 tqdm>=4.66
 
 # Deep learning
-torch>=2.1
-torchvision>=0.16
+# torch / torchvision are pinned to the highest pair the cu128 index ships
+# for Python 3.13 (verified: https://download.pytorch.org/whl/cu128/torch/).
+# Newer torch (2.10+) is only published with cu130 wheels. If you switch
+# CUDA versions above, bump these too (or relax to >= and let pip pick).
+torch==2.9.1
+torchvision==0.24.1
 segmentation-models-pytorch>=0.3.4
 
 # Notebook (data inspection)
