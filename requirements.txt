@@ -1,3 +1,24 @@
+# --- CUDA-enabled PyTorch ----------------------------------------------------
+# On Linux this pulls the CUDA wheel from the PyTorch index automatically.
+# On macOS the URL has no Darwin wheels, so pip silently falls back to PyPI
+# and installs the regular CPU/MPS wheel — no action needed there.
+#
+# Pick the URL that matches your driver's CUDA version. The full matrix is at
+# https://pytorch.org/get-started/locally/. Common alternatives:
+#   cu118  →  CUDA 11.8 (older drivers)
+#   cu121  →  CUDA 12.1
+#   cu124  →  CUDA 12.4
+#   cu126  →  CUDA 12.6   (default below — works with any 12.6+ driver)
+#   cu128  →  CUDA 12.8
+#   cu130  →  CUDA 13.0 (newest; requires CUDA 13 driver)
+# Check your server with: `nvidia-smi` (look at the "CUDA Version" column).
+# NOTE: this MUST be `--index-url`, not `--extra-index-url`. Otherwise pip
+# can still pick a newer cu130 wheel from PyPI and you'll get a driver
+# mismatch at `torch.cuda.is_available()`.
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+# -----------------------------------------------------------------------------
+
 # Core
 numpy>=1.26
 opencv-python>=4.10
