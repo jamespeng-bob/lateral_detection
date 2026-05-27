@@ -1,0 +1,24 @@
+# Base configuration for lateral_detection.
+# All paths are resolved relative to the repository root unless absolute.
+
+data:
+  dataset_root: ../datasets/keypoints.v56-lat_only_baseline.coco
+  train_dir: train
+  valid_dir: valid
+  test_dir:  test
+
+# COCO category id for lateral lines in the Roboflow export.
+lateral_category_id: 1
+
+# Polyline reconstruction.
+polyline:
+  # Annotation endpoints within this many pixels are fused into a single
+  # vertex (centroid of the cluster). The labellers are imperfect, so this
+  # is needed to chain consecutive chords back into long polylines.
+  merge_radius: 10
+
+# Ground-truth rasterization.
+rasterize:
+  # Stroke thickness in pixels at native image resolution. Should
+  # roughly match the line width on the blueprint (~4 px).
+  thickness: 4

@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Outputs / runs / weights
+results/
+runs/
+weights/
+checkpoints/
+*.pth
+*.ckpt
+*.pt
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+wandb/
+
+# Secrets — never commit credentials, API keys, or service account JSON.
+# Service account JSONs from inference-428300 or any GCP project:
+inference-*.json
+*-service-account*.json
+credentials/
+.env
+.env.*
+

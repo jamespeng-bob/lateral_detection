@@ -1,0 +1,16 @@
+# Core
+numpy>=1.26
+opencv-python>=4.10
+pillow>=10.0
+pyyaml>=6.0
+
+# Notebook (data inspection)
+jupyterlab>=4.0
+ipykernel>=6.0
+matplotlib>=3.8
+nbstripout>=0.7
+
+# Symbol localizer API (Vertex AI + GCS) — used by symbols/call_symbol_localizer.py
+google-cloud-aiplatform>=1.50
+google-cloud-storage>=2.10
+google-auth>=2.20
