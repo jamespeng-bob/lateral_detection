@@ -31,7 +31,7 @@ loss:
   focal_gamma:    2.0
 
 training:
-  batch_size:  4
+  batch_size:  16
   num_workers: 4
   epochs:      80
   lr:          1.0e-4
