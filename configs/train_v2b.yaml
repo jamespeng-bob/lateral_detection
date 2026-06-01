@@ -1,0 +1,15 @@
+# v2b — HGNetv2-B4 encoder, otherwise identical to v1.
+#
+# Encoder family: modern CNN (22.5 M params, Baidu's HGNet-v2).
+# Hypothesis:     same encoder family the walls team converged on (they use B5);
+#                 we pick B4 because we're data-poor (121 train images).
+#                 Tests whether "modern CNN design" beats the EfficientNet line.
+#
+# Usage:
+#   python train.py --overlay configs/train_v2b.yaml --device cuda:0
+
+model:
+  encoder: tu-hgnetv2_b4
+
+training:
+  save_dir: runs/v2b_hgnetv2b4_bcedice

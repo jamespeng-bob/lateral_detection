@@ -1,0 +1,14 @@
+# v2a — EfficientNet-B3 encoder, otherwise identical to v1.
+#
+# Encoder family: efficient CNN (12.6 M params).
+# Hypothesis:     a well-tuned, parameter-efficient CNN should give a clean
+#                 +1 to +3 Dice over ResNet-34 (21 M) with low overfitting risk.
+#
+# Usage:
+#   python train.py --overlay configs/train_v2a.yaml --device cuda:0
+
+model:
+  encoder: tu-efficientnet_b3
+
+training:
+  save_dir: runs/v2a_effb3_bcedice

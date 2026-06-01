@@ -1,0 +1,16 @@
+# v2c — MiT-B2 encoder (SegFormer's hierarchical transformer), otherwise identical to v1.
+#
+# Encoder family: hierarchical transformer (27.5 M params).
+# Hypothesis:     tests whether attention helps on our task at all. MiT/SegFormer
+#                 was designed for dense prediction (not classification), so it
+#                 avoids the vanilla-ViT failure mode of destroying thin lines
+#                 with a 16x patch stem — its 4x stem keeps fine spatial detail.
+#
+# Usage:
+#   python train.py --overlay configs/train_v2c.yaml --device cuda:0
+
+model:
+  encoder: mit_b2
+
+training:
+  save_dir: runs/v2c_mitb2_bcedice

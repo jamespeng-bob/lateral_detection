@@ -5,7 +5,12 @@ Usage
     python train.py
     python train.py --config configs/train.yaml --device cuda:0
 
+    # Layer a per-experiment overlay (only the differences from train.yaml):
+    python train.py --overlay configs/train_v2a.yaml --device cuda:0
+
 By default it reads ``configs/base.yaml`` and overlays ``configs/train.yaml``.
+``--overlay`` applies a third layer on top of ``--config`` so each experiment
+only needs to declare the keys it changes.
 """
 
 from __future__ import annotations
@@ -106,6 +111,12 @@ def main() -> int:
     parser.add_argument("--base-config", default="configs/base.yaml")
     parser.add_argument("--config", default="configs/train.yaml")
     parser.add_argument(
+        "--overlay",
+        default=None,
+        help="Optional extra config layer (e.g. configs/train_v2a.yaml) applied "
+             "on top of --config. Lets each experiment declare only its diffs.",
+    )
+    parser.add_argument(
         "--device",
         default=None,
         help="Override training.device (e.g. cuda:0, cpu, mps).",
@@ -120,6 +131,9 @@ def main() -> int:
     base_cfg  = yaml.safe_load(open(args.base_config))
     train_cfg = yaml.safe_load(open(args.config))
     cfg = merge_configs(base_cfg, train_cfg)
+    if args.overlay is not None:
+        overlay_cfg = yaml.safe_load(open(args.overlay))
+        cfg = merge_configs(cfg, overlay_cfg)
 
     if args.save_dir is not None:
         cfg["training"]["save_dir"] = args.save_dir
