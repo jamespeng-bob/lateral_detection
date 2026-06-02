@@ -16,8 +16,16 @@ only needs to declare the keys it changes.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# Allow the cached allocator to grow segments on demand instead of clamping
+# at the largest pre-allocated block. With dense U-Net activations at 1024²
+# this routinely buys us 1–3 GB of usable VRAM by avoiding fragmentation,
+# which can be the difference between fitting bs=8 and OOMing.
+# Must be set BEFORE the first `import torch` allocator interaction.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import yaml

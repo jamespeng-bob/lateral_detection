@@ -31,7 +31,11 @@ loss:
   focal_gamma:    2.0
 
 training:
-  batch_size:  16
+  # bs=16 fits a ResNet-34 unet at 1024² (~7 GB) but spills to >30 GB for
+  # EfficientNet/MiT encoders because activations dominate at this resolution
+  # and those encoders save more intermediate tensors than ResNet does.
+  # bs=8 fits all three v2 variants on a 32 GB GPU with comfortable headroom.
+  batch_size:  8
   num_workers: 4
   epochs:      80
   lr:          1.0e-4
