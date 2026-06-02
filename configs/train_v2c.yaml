@@ -13,4 +13,8 @@ model:
   encoder: mit_b2
 
 training:
+  # MiT-B2 OOMs at bs=8: the attention matmul (q @ k.T) at 1024^2 input is
+  # genuinely O(N^2) memory and blows the 32 GB budget. bs=4 fits with
+  # comfortable headroom (~12-14 GB). Same impurity caveat as v2a.
+  batch_size: 4
   save_dir: runs/v2c_mitb2_bcedice
