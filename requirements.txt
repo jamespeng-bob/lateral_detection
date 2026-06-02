@@ -32,6 +32,7 @@ opencv-python>=4.10
 pillow>=10.0
 pyyaml>=6.0
 tqdm>=4.66
+scikit-image>=0.22   # skimage.morphology.skeletonize for clDice + length-ratio metrics
 
 # Deep learning
 # torch / torchvision are pinned to the highest pair the cu128 index ships

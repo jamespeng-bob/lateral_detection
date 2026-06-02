@@ -29,6 +29,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from .metrics import BinaryClDiceAccumulator, LengthRatioAccumulator
+
 
 @dataclass
 class TrainerConfig:
@@ -84,9 +86,22 @@ class SegTrainer:
             "val_dice_loss":   [],
             "val_dice":        [],
             "val_iou":         [],
+            "val_cldice":      [],
+            "val_length_ratio_pixel_mean":   [],
+            "val_length_ratio_pixel_median": [],
+            "val_length_ratio_pixel_p25":    [],
+            "val_length_ratio_pixel_p75":    [],
+            "val_length_ratio_skel_mean":    [],
+            "val_length_ratio_skel_median":  [],
+            "val_length_ratio_skel_p25":     [],
+            "val_length_ratio_skel_p75":     [],
         }
         self.best_val_dice = -1.0
         self.best_val_loss = float("inf")
+
+        # Stateful accumulators reset at the start of every val epoch.
+        self._cldice_acc = BinaryClDiceAccumulator(threshold=0.5)
+        self._length_acc = LengthRatioAccumulator(threshold=0.5)
 
     # ------------------------------------------------------------------
     # Metric helpers
@@ -163,6 +178,11 @@ class SegTrainer:
         viz_dir = self.save_dir / "val_viz"
         viz_dir.mkdir(parents=True, exist_ok=True)
 
+        # Stateful clDice + length-ratio accumulators: reset, populate per
+        # batch, compute once at the end of the epoch.
+        self._cldice_acc.reset()
+        self._length_acc.reset()
+
         pbar = tqdm(self.val_loader, desc="val", leave=False)
         for batch in pbar:
             images, masks = self._to_device(batch)
@@ -176,6 +196,11 @@ class SegTrainer:
             totals["dice"]      += float(dice.item())
             totals["iou"]       += float(iou.item())
             n += 1
+
+            # Per-batch metric updates (the heavy lifting — skeletonization
+            # on CPU — happens inside these calls).
+            self._cldice_acc.update(logits, masks)
+            self._length_acc.update(logits, masks)
 
             if viz_saved < self.config.val_viz_count:
                 self._save_viz_panel(
@@ -195,12 +220,15 @@ class SegTrainer:
             )
 
         n = max(n, 1)
-        return {
+        out = {
             "total":     totals["total"]     / n,
             "dice_loss": totals["dice_loss"] / n,
             "dice":      totals["dice"]      / n,
             "iou":       totals["iou"]       / n,
+            "cldice":    self._cldice_acc.compute(),
         }
+        out.update(self._length_acc.compute())
+        return out
 
     # ------------------------------------------------------------------
     # Visualization
@@ -253,26 +281,56 @@ class SegTrainer:
         self.history["val_dice_loss"].append(val_metrics["dice_loss"])
         self.history["val_dice"].append(val_metrics["dice"])
         self.history["val_iou"].append(val_metrics["iou"])
+        self.history["val_cldice"].append(val_metrics.get("cldice", float("nan")))
+        for key in (
+            "length_ratio_pixel_mean", "length_ratio_pixel_median",
+            "length_ratio_pixel_p25",  "length_ratio_pixel_p75",
+            "length_ratio_skel_mean",  "length_ratio_skel_median",
+            "length_ratio_skel_p25",   "length_ratio_skel_p75",
+        ):
+            self.history[f"val_{key}"].append(val_metrics.get(key, float("nan")))
 
     def _save_history(self) -> None:
         (self.save_dir / "history.json").write_text(json.dumps(self.history, indent=2))
 
     def _save_plots(self) -> None:
         epochs = list(range(1, len(self.history["train_total"]) + 1))
-        fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+        fig, axes = plt.subplots(1, 4, figsize=(24, 4))
 
+        # Total loss train vs val
         axes[0].plot(epochs, self.history["train_total"], label="train", marker="o", markersize=3)
         axes[0].plot(epochs, self.history["val_total"],   label="val",   marker="s", markersize=3)
         axes[0].set_title("total loss"); axes[0].set_xlabel("epoch"); axes[0].legend(); axes[0].grid(True, alpha=0.3)
 
+        # Dice-component loss train vs val
         axes[1].plot(epochs, self.history["train_dice_loss"], label="train", marker="o", markersize=3)
         axes[1].plot(epochs, self.history["val_dice_loss"],   label="val",   marker="s", markersize=3)
         axes[1].set_title("dice loss"); axes[1].set_xlabel("epoch"); axes[1].legend(); axes[1].grid(True, alpha=0.3)
 
-        axes[2].plot(epochs, self.history["val_dice"], label="dice", marker="o", markersize=3)
-        axes[2].plot(epochs, self.history["val_iou"],  label="iou",  marker="s", markersize=3)
-        axes[2].set_title("val metrics"); axes[2].set_xlabel("epoch"); axes[2].legend()
-        axes[2].set_ylim(0, 1); axes[2].grid(True, alpha=0.3)
+        # Region-overlap val metrics (pixel-level Dice, IoU, and clDice).
+        # clDice and Dice differ when predictions are correctly *placed* but
+        # *disconnected*: Dice stays high, clDice drops.
+        axes[2].plot(epochs, self.history["val_dice"],   label="dice",   marker="o", markersize=3)
+        axes[2].plot(epochs, self.history["val_iou"],    label="iou",    marker="s", markersize=3)
+        axes[2].plot(epochs, self.history["val_cldice"], label="clDice", marker="^", markersize=3)
+        axes[2].set_title("val region metrics")
+        axes[2].set_xlabel("epoch"); axes[2].legend(); axes[2].set_ylim(0, 1); axes[2].grid(True, alpha=0.3)
+
+        # Length recovery — the deployment-aligned metric.
+        # Ratio of 1.0 = exact length recovered. The IQR bands are p25–p75
+        # across val tiles for each ratio variant. Pixel ratio is sensitive
+        # to width; skeleton ratio is width-invariant.
+        ax = axes[3]
+        for name, color in (("pixel", "C0"), ("skel", "C1")):
+            mean = self.history[f"val_length_ratio_{name}_mean"]
+            p25  = self.history[f"val_length_ratio_{name}_p25"]
+            p75  = self.history[f"val_length_ratio_{name}_p75"]
+            ax.plot(epochs, mean, label=f"{name} mean", color=color, marker="o", markersize=3)
+            ax.fill_between(epochs, p25, p75, color=color, alpha=0.15, label=f"{name} p25–p75")
+        ax.axhline(1.0, color="k", linestyle="--", linewidth=1, alpha=0.5, label="ideal = 1.0")
+        ax.set_title("val length ratio (pred / GT)")
+        ax.set_xlabel("epoch"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+        ax.set_ylim(0, 2.0)
 
         fig.tight_layout()
         fig.savefig(self.save_dir / "history.png", dpi=120)
@@ -318,7 +376,16 @@ class SegTrainer:
             print(
                 f"  val:   total={val_metrics['total']:.4f}  "
                 f"dice_loss={val_metrics['dice_loss']:.4f}  "
-                f"dice={val_metrics['dice']:.4f}  iou={val_metrics['iou']:.4f}"
+                f"dice={val_metrics['dice']:.4f}  iou={val_metrics['iou']:.4f}  "
+                f"cldice={val_metrics['cldice']:.4f}"
+            )
+            # Length-ratio summary: 1.0 = perfect length recovery; pixel
+            # ratio is width-sensitive, skeleton ratio is width-invariant.
+            print(
+                f"  len:   pixel={val_metrics['length_ratio_pixel_mean']:.3f} "
+                f"(median {val_metrics['length_ratio_pixel_median']:.3f})  "
+                f"skeleton={val_metrics['length_ratio_skel_mean']:.3f} "
+                f"(median {val_metrics['length_ratio_skel_median']:.3f})"
             )
 
             improved = self._maybe_save_best(epoch, val_metrics)
