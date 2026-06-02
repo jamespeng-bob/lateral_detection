@@ -1,16 +1,27 @@
 """train.py — lateral binary segmentation trainer entrypoint.
 
-Usage
------
+Single-GPU and DDP both supported through the same script.
+
+Single-GPU
+----------
     python train.py
     python train.py --config configs/train.yaml --device cuda:0
+    python train.py --overlay configs/train_v3a.yaml --device cuda:0
 
-    # Layer a per-experiment overlay (only the differences from train.yaml):
-    python train.py --overlay configs/train_v2a.yaml --device cuda:0
+DDP (across N GPUs on one host)
+-------------------------------
+    torchrun --nproc-per-node=2 --master-port=29500 train.py \
+        --overlay configs/train_v2a.yaml
 
-By default it reads ``configs/base.yaml`` and overlays ``configs/train.yaml``.
-``--overlay`` applies a third layer on top of ``--config`` so each experiment
-only needs to declare the keys it changes.
+`torchrun` sets RANK / LOCAL_RANK / WORLD_SIZE in the environment; we
+detect those and set up the process group automatically. With DDP,
+`training.batch_size` in the config is interpreted as PER-GPU; effective
+global batch = `batch_size * world_size`.
+
+Config layering
+---------------
+``--base-config`` → ``--config`` → ``--overlay``. Later layers override
+earlier ones; each layer can omit any field it doesn't change.
 """
 
 from __future__ import annotations
@@ -21,15 +32,16 @@ import sys
 from pathlib import Path
 
 # Allow the cached allocator to grow segments on demand instead of clamping
-# at the largest pre-allocated block. With dense U-Net activations at 1024²
-# this routinely buys us 1–3 GB of usable VRAM by avoiding fragmentation,
-# which can be the difference between fitting bs=8 and OOMing.
+# at the largest pre-allocated block. With dense U-Net activations at 1024^2
+# this routinely buys us 1–3 GB of usable VRAM by avoiding fragmentation.
 # Must be set BEFORE the first `import torch` allocator interaction.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
+import torch.distributed as dist
 import yaml
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 # Make repo modules importable when running the file directly.
 ROOT = Path(__file__).resolve().parent
@@ -43,6 +55,11 @@ from training.losses import build_loss
 from training.trainer import SegTrainer, TrainerConfig
 
 
+# ---------------------------------------------------------------------------
+# Config layering
+# ---------------------------------------------------------------------------
+
+
 def merge_configs(base: dict, override: dict) -> dict:
     """Shallow recursive merge: nested dicts are merged one level deep."""
     out = dict(base)
@@ -54,16 +71,53 @@ def merge_configs(base: dict, override: dict) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Device + DDP setup
+# ---------------------------------------------------------------------------
+
+
+def _torchrun_launched() -> bool:
+    """True when this process was started by torchrun (DDP)."""
+    return all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE"))
+
+
+def setup_ddp() -> tuple[int, int, int, str]:
+    """Initialize the NCCL process group.
+
+    Returns ``(local_rank, global_rank, world_size, device)``. Must only be
+    called when ``_torchrun_launched()`` is True.
+    """
+    local_rank = int(os.environ["LOCAL_RANK"])
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        backend = "nccl"
+        device = f"cuda:{local_rank}"
+    else:
+        backend = "gloo"
+        device = "cpu"
+    dist.init_process_group(backend=backend)
+    return local_rank, dist.get_rank(), dist.get_world_size(), device
+
+
 def _resolve_device(name: str) -> str:
+    """Resolve --device for single-GPU runs (DDP overrides this)."""
     if name.startswith("cuda") and not torch.cuda.is_available():
         print(f"[train] CUDA not available; falling back from {name!r} to 'cpu'.")
         return "cpu"
-    if name == "mps" and not getattr(torch.backends, "mps", None) or (
-        name == "mps" and not torch.backends.mps.is_available()
-    ):
-        print("[train] MPS not available; falling back to 'cpu'.")
-        return "cpu"
+    if name == "mps":
+        mps_ok = (
+            getattr(torch.backends, "mps", None) is not None
+            and torch.backends.mps.is_available()
+        )
+        if not mps_ok:
+            print("[train] MPS not available; falling back to 'cpu'.")
+            return "cpu"
     return name
+
+
+# ---------------------------------------------------------------------------
+# Dataset / loader construction (DDP-aware)
+# ---------------------------------------------------------------------------
 
 
 def build_datasets(cfg: dict) -> tuple[TileDataset, TileDataset]:
@@ -114,6 +168,56 @@ def build_datasets(cfg: dict) -> tuple[TileDataset, TileDataset]:
     return train_ds, val_ds
 
 
+def build_loaders(
+    train_ds: TileDataset,
+    val_ds: TileDataset,
+    cfg: dict,
+    device: str,
+    world_size: int,
+    global_rank: int,
+) -> tuple[DataLoader, DataLoader]:
+    bs = int(cfg["training"]["batch_size"])
+    nw = int(cfg["training"]["num_workers"])
+    persistent = nw > 0
+    pin_memory = device != "cpu"
+
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=world_size, rank=global_rank, shuffle=True,
+            drop_last=False,
+        )
+        val_sampler = DistributedSampler(
+            val_ds,   num_replicas=world_size, rank=global_rank, shuffle=False,
+            drop_last=False,
+        )
+        train_shuffle = False  # DistributedSampler handles shuffling
+    else:
+        train_sampler = None
+        val_sampler   = None
+        train_shuffle = True
+
+    train_loader = DataLoader(
+        train_ds, batch_size=bs, shuffle=train_shuffle, sampler=train_sampler,
+        num_workers=nw, pin_memory=pin_memory,
+        collate_fn=collate_tile_samples,
+        worker_init_fn=worker_init_fn,
+        persistent_workers=persistent,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=bs, shuffle=False, sampler=val_sampler,
+        num_workers=nw, pin_memory=pin_memory,
+        collate_fn=collate_tile_samples,
+        worker_init_fn=worker_init_fn,
+        persistent_workers=persistent,
+    )
+    return train_loader, val_loader
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Lateral segmentation trainer.")
     parser.add_argument("--base-config", default="configs/base.yaml")
@@ -127,7 +231,8 @@ def main() -> int:
     parser.add_argument(
         "--device",
         default=None,
-        help="Override training.device (e.g. cuda:0, cpu, mps).",
+        help="Override training.device (e.g. cuda:0, cpu, mps). Ignored under "
+             "torchrun (DDP picks up LOCAL_RANK).",
     )
     parser.add_argument(
         "--save-dir",
@@ -136,42 +241,55 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # ── Load + merge configs ─────────────────────────────────────────────
     base_cfg  = yaml.safe_load(open(args.base_config))
     train_cfg = yaml.safe_load(open(args.config))
     cfg = merge_configs(base_cfg, train_cfg)
     if args.overlay is not None:
         overlay_cfg = yaml.safe_load(open(args.overlay))
         cfg = merge_configs(cfg, overlay_cfg)
-
     if args.save_dir is not None:
         cfg["training"]["save_dir"] = args.save_dir
 
-    device = _resolve_device(args.device or cfg["training"].get("device", "cuda"))
+    # ── Device / DDP setup ───────────────────────────────────────────────
+    if _torchrun_launched():
+        local_rank, global_rank, world_size, device = setup_ddp()
+    else:
+        device = _resolve_device(args.device or cfg["training"].get("device", "cuda"))
+        local_rank, global_rank, world_size = 0, 0, 1
 
+    is_rank_zero = (global_rank == 0)
+
+    # ── Datasets + loaders ───────────────────────────────────────────────
     train_ds, val_ds = build_datasets(cfg)
-    print(f"[train] train tiles: {len(train_ds)},  val tiles: {len(val_ds)}")
-
-    bs = int(cfg["training"]["batch_size"])
-    nw = int(cfg["training"]["num_workers"])
-    persistent = nw > 0  # avoid re-forking workers every epoch (cheap win)
-    train_loader = DataLoader(
-        train_ds, batch_size=bs, shuffle=True,  num_workers=nw,
-        pin_memory=(device != "cpu"),
-        collate_fn=collate_tile_samples,
-        worker_init_fn=worker_init_fn,
-        persistent_workers=persistent,
+    train_loader, val_loader = build_loaders(
+        train_ds, val_ds, cfg, device=device,
+        world_size=world_size, global_rank=global_rank,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=bs, shuffle=False, num_workers=nw,
-        pin_memory=(device != "cpu"),
-        collate_fn=collate_tile_samples,
-        worker_init_fn=worker_init_fn,
-        persistent_workers=persistent,
-    )
+    if is_rank_zero:
+        per_gpu = int(cfg["training"]["batch_size"])
+        eff_bs  = per_gpu * world_size
+        print(f"[train] world_size={world_size}  per-GPU bs={per_gpu}  "
+              f"effective bs={eff_bs}")
+        print(f"[train] train tiles: {len(train_ds)},  val tiles: {len(val_ds)}")
 
-    model = build_model(cfg["model"])
+    # ── Model + loss ─────────────────────────────────────────────────────
+    model = build_model(cfg["model"]).to(device)
+
+    if world_size > 1:
+        # Sync BatchNorm running stats across ranks so the running mean/var
+        # are computed on the global effective batch, not just one rank's
+        # shard. Without this, BN stats would be on per-GPU bs=4 while v2b
+        # (the comparison baseline) trained on bs=8.
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank,
+            find_unused_parameters=False,
+        )
+
     criterion = build_loss(cfg["loss"])
 
+    # ── Trainer config ──────────────────────────────────────────────────
     trainer_cfg = TrainerConfig(
         save_dir=cfg["training"]["save_dir"],
         epochs=int(cfg["training"]["epochs"]),
@@ -184,11 +302,13 @@ def main() -> int:
         best_metric=str(cfg["training"]["best_metric"]),
     )
 
-    print(
-        f"[train] device={device}  model={cfg['model']['name']}/{cfg['model']['encoder']}  "
-        f"loss={cfg['loss']['name']}  save_dir={trainer_cfg.save_dir}"
-    )
+    if is_rank_zero:
+        print(
+            f"[train] device={device}  model={cfg['model']['name']}/{cfg['model']['encoder']}  "
+            f"loss={cfg['loss']['name']}  save_dir={trainer_cfg.save_dir}"
+        )
 
+    # ── Run ──────────────────────────────────────────────────────────────
     trainer = SegTrainer(
         model=model,
         criterion=criterion,
@@ -198,6 +318,11 @@ def main() -> int:
         normalization=(cfg["normalization"]["mean"], cfg["normalization"]["std"]),
     )
     trainer.run()
+
+    # ── Cleanup ──────────────────────────────────────────────────────────
+    if world_size > 1:
+        dist.barrier()
+        dist.destroy_process_group()
     return 0
 
 

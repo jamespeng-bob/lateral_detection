@@ -72,6 +72,18 @@ see it appear under `git status` as staged, stop and tell the user.
 
 ---
 
+## Training launch
+
+- Single GPU:  `python train.py --overlay configs/<exp>.yaml --device cuda:0`
+- DDP (multi-GPU on one host):
+      `torchrun --nproc-per-node=2 --master-port=29500 train.py --overlay configs/<exp>.yaml`
+- `training.batch_size` in any config is **per-GPU**. Effective global
+  batch under DDP = `batch_size * world_size`. SyncBatchNorm is enabled
+  automatically when `world_size > 1` so BN running stats are computed
+  on the global effective batch.
+- Use a different `--master-port` per concurrent torchrun (rapid
+  sequential launches occasionally fail to release the port in time).
+
 ## Code conventions
 
 - Paths: `pathlib.Path`, never `os.path.join` and never absolute paths in code.

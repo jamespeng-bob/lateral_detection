@@ -1,13 +1,16 @@
-"""Vanilla-PyTorch training loop for binary lateral segmentation.
+"""Train/val loop for binary lateral segmentation.
 
-Responsibilities
-----------------
-- Optimization with AdamW + grad clipping
-- Epoch loop with tqdm progress
-- Per-epoch validation with Dice + IoU metrics
-- Best-by-val-Dice checkpoint + last-epoch checkpoint
-- Per-epoch matplotlib loss curve + JSON history
-- Per-epoch validation visualization (image / GT / pred / probability)
+Single-GPU and DDP both supported through the same class. When DDP is
+active (``torch.distributed.is_initialized()``):
+
+- All ranks run the forward/backward train loop on their data shard.
+- All ranks run the validation loop on their val shard.
+- Metric accumulators all-reduce / all-gather inside ``compute()`` so the
+  reported numbers are the *global* val metric over the whole val set.
+- Only rank 0 prints, writes ``history.{json,png}``, writes checkpoints,
+  and writes ``val_viz`` images. Other ranks are silent.
+
+Single-GPU runs work unchanged — every DDP check short-circuits.
 """
 
 from __future__ import annotations
@@ -15,11 +18,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -29,7 +32,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from .metrics import BinaryClDiceAccumulator, LengthRatioAccumulator
+from .metrics import (
+    BinaryClDiceAccumulator,
+    BinaryDiceAccumulator,
+    BinaryIoUAccumulator,
+    LengthRatioAccumulator,
+)
 
 
 @dataclass
@@ -45,8 +53,41 @@ class TrainerConfig:
     best_metric: str = "dice"   # 'dice' or 'loss'
 
 
+# ---------------------------------------------------------------------------
+# DDP helpers (mirrors metrics.py — defined here too so the trainer doesn't
+# need to import private helpers)
+# ---------------------------------------------------------------------------
+
+
+def _ddp_active() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _is_rank_zero() -> bool:
+    return (not _ddp_active()) or dist.get_rank() == 0
+
+
+def _world_size() -> int:
+    return dist.get_world_size() if _ddp_active() else 1
+
+
+def _all_reduce_mean(value: float) -> float:
+    """Mean ``value`` across all ranks (no-op in single-GPU mode)."""
+    if not _ddp_active():
+        return float(value)
+    device = torch.device("cuda", torch.cuda.current_device())
+    t = torch.tensor([float(value)], device=device, dtype=torch.float64)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return float((t / dist.get_world_size()).item())
+
+
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
+
+
 class SegTrainer:
-    """Train a binary segmentation model end-to-end."""
+    """Train a binary segmentation model end-to-end (single GPU or DDP)."""
 
     def __init__(
         self,
@@ -60,21 +101,28 @@ class SegTrainer:
             [0.229, 0.224, 0.225],
         ),
     ) -> None:
-        self.model = model.to(config.device)
+        # Caller is responsible for moving model to the right device + DDP wrap.
+        self.model = model
         self.criterion = criterion.to(config.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
         self.device = config.device
 
+        # Use the raw model for parameter collection (DDP wraps it once).
+        params = (
+            self.model.module.parameters() if hasattr(self.model, "module")
+            else self.model.parameters()
+        )
         self.optimizer = optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
+            [p for p in params if p.requires_grad],
             lr=float(config.lr),
             weight_decay=float(config.weight_decay),
         )
 
         self.save_dir = Path(config.save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+        if _is_rank_zero():
+            self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.mean = np.array(normalization[0], dtype=np.float32).reshape(3, 1, 1)
         self.std  = np.array(normalization[1], dtype=np.float32).reshape(3, 1, 1)
@@ -99,39 +147,15 @@ class SegTrainer:
         self.best_val_dice = -1.0
         self.best_val_loss = float("inf")
 
-        # Stateful accumulators reset at the start of every val epoch.
+        # All val accumulators are reset at the start of every val epoch.
+        self._dice_acc   = BinaryDiceAccumulator(threshold=0.5)
+        self._iou_acc    = BinaryIoUAccumulator(threshold=0.5)
         self._cldice_acc = BinaryClDiceAccumulator(threshold=0.5)
         self._length_acc = LengthRatioAccumulator(threshold=0.5)
 
     # ------------------------------------------------------------------
-    # Metric helpers
+    # Batch helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _dice_metric(
-        logits: torch.Tensor,
-        target: torch.Tensor,
-        threshold: float = 0.5,
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        prob = (torch.sigmoid(logits) >= threshold).float()
-        target = (target >= 0.5).float()
-        inter = (prob * target).sum()
-        denom = prob.sum() + target.sum()
-        return (2.0 * inter + eps) / (denom + eps)
-
-    @staticmethod
-    def _iou_metric(
-        logits: torch.Tensor,
-        target: torch.Tensor,
-        threshold: float = 0.5,
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        prob = (torch.sigmoid(logits) >= threshold).float()
-        target = (target >= 0.5).float()
-        inter = (prob * target).sum()
-        union = prob.sum() + target.sum() - inter
-        return (inter + eps) / (union + eps)
 
     def _to_device(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
         return (
@@ -139,15 +163,22 @@ class SegTrainer:
             batch["mask"].to(self.device,  non_blocking=True),
         )
 
+    def _set_epoch_on_sampler(self, loader: DataLoader, epoch: int) -> None:
+        """Bump the DistributedSampler's epoch so shuffling differs each epoch."""
+        sampler = getattr(loader, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+
     # ------------------------------------------------------------------
     # Train / val epochs
     # ------------------------------------------------------------------
 
-    def train_epoch(self) -> dict[str, float]:
+    def train_epoch(self, epoch: int) -> dict[str, float]:
         self.model.train()
+        self._set_epoch_on_sampler(self.train_loader, epoch)
         totals = {"total": 0.0, "dice_loss": 0.0}
         n = 0
-        pbar = tqdm(self.train_loader, desc="train", leave=False)
+        pbar = tqdm(self.train_loader, desc="train", leave=False, disable=not _is_rank_zero())
         for batch in pbar:
             images, masks = self._to_device(batch)
             self.optimizer.zero_grad(set_to_none=True)
@@ -155,54 +186,61 @@ class SegTrainer:
             losses = self.criterion(logits, masks)
             losses["total"].backward()
             if self.config.grad_clip > 0:
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.config.grad_clip
+                )
             self.optimizer.step()
 
             totals["total"]     += float(losses["total"].item())
             totals["dice_loss"] += float(losses["dice"].item())
             n += 1
-            if n % self.config.log_interval == 0:
+            if n % self.config.log_interval == 0 and _is_rank_zero():
                 pbar.set_postfix(
                     total=f"{totals['total']/n:.4f}",
                     dice=f"{totals['dice_loss']/n:.4f}",
                 )
         n = max(n, 1)
-        return {"total": totals["total"] / n, "dice_loss": totals["dice_loss"] / n}
+        # All-reduce the per-rank running averages so the printed/logged
+        # number is the global (not per-shard) mean.
+        return {
+            "total":     _all_reduce_mean(totals["total"] / n),
+            "dice_loss": _all_reduce_mean(totals["dice_loss"] / n),
+        }
 
     @torch.no_grad()
     def val_epoch(self, epoch: int) -> dict[str, float]:
         self.model.eval()
-        totals = {"total": 0.0, "dice_loss": 0.0, "dice": 0.0, "iou": 0.0}
+        self._set_epoch_on_sampler(self.val_loader, epoch)
+
+        totals = {"total": 0.0, "dice_loss": 0.0}
         n = 0
         viz_saved = 0
         viz_dir = self.save_dir / "val_viz"
-        viz_dir.mkdir(parents=True, exist_ok=True)
+        if _is_rank_zero():
+            viz_dir.mkdir(parents=True, exist_ok=True)
 
-        # Stateful clDice + length-ratio accumulators: reset, populate per
-        # batch, compute once at the end of the epoch.
-        self._cldice_acc.reset()
-        self._length_acc.reset()
+        for acc in (self._dice_acc, self._iou_acc, self._cldice_acc, self._length_acc):
+            acc.reset()
 
-        pbar = tqdm(self.val_loader, desc="val", leave=False)
+        pbar = tqdm(self.val_loader, desc="val", leave=False, disable=not _is_rank_zero())
         for batch in pbar:
             images, masks = self._to_device(batch)
             logits = self.model(images)
             losses = self.criterion(logits, masks)
-            dice = self._dice_metric(logits, masks)
-            iou  = self._iou_metric(logits, masks)
 
             totals["total"]     += float(losses["total"].item())
             totals["dice_loss"] += float(losses["dice"].item())
-            totals["dice"]      += float(dice.item())
-            totals["iou"]       += float(iou.item())
             n += 1
 
-            # Per-batch metric updates (the heavy lifting — skeletonization
-            # on CPU — happens inside these calls).
+            # Accumulator metrics — counts are global after compute()'s
+            # all-reduce, so they're equivalent to single-GPU bs=N*world.
+            self._dice_acc.update(logits, masks)
+            self._iou_acc.update(logits, masks)
             self._cldice_acc.update(logits, masks)
             self._length_acc.update(logits, masks)
 
-            if viz_saved < self.config.val_viz_count:
+            # Only rank 0 saves val viz so we don't write conflicting JPEGs.
+            if _is_rank_zero() and viz_saved < self.config.val_viz_count:
                 self._save_viz_panel(
                     images.detach().cpu(),
                     masks.detach().cpu(),
@@ -214,30 +252,25 @@ class SegTrainer:
                 )
                 viz_saved += images.shape[0]
 
-            pbar.set_postfix(
-                dice=f"{totals['dice']/n:.4f}",
-                iou=f"{totals['iou']/n:.4f}",
-            )
-
         n = max(n, 1)
         out = {
-            "total":     totals["total"]     / n,
-            "dice_loss": totals["dice_loss"] / n,
-            "dice":      totals["dice"]      / n,
-            "iou":       totals["iou"]       / n,
+            "total":     _all_reduce_mean(totals["total"]     / n),
+            "dice_loss": _all_reduce_mean(totals["dice_loss"] / n),
+            "dice":      self._dice_acc.compute(),
+            "iou":       self._iou_acc.compute(),
             "cldice":    self._cldice_acc.compute(),
         }
         out.update(self._length_acc.compute())
         return out
 
     # ------------------------------------------------------------------
-    # Visualization
+    # Visualization (rank 0 only)
     # ------------------------------------------------------------------
 
     def _denormalize(self, img_t: torch.Tensor) -> np.ndarray:
         img = img_t.numpy() * self.std + self.mean
         img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
-        return img.transpose(1, 2, 0)  # → [H, W, 3] RGB
+        return img.transpose(1, 2, 0)
 
     def _save_viz_panel(
         self,
@@ -271,7 +304,7 @@ class SegTrainer:
             cv2.imwrite(str(out_path), cv2.cvtColor(row, cv2.COLOR_RGB2BGR))
 
     # ------------------------------------------------------------------
-    # History + checkpoints
+    # History + checkpoints (rank 0 only)
     # ------------------------------------------------------------------
 
     def _update_history(self, train_metrics: dict, val_metrics: dict) -> None:
@@ -297,29 +330,20 @@ class SegTrainer:
         epochs = list(range(1, len(self.history["train_total"]) + 1))
         fig, axes = plt.subplots(1, 4, figsize=(24, 4))
 
-        # Total loss train vs val
         axes[0].plot(epochs, self.history["train_total"], label="train", marker="o", markersize=3)
         axes[0].plot(epochs, self.history["val_total"],   label="val",   marker="s", markersize=3)
         axes[0].set_title("total loss"); axes[0].set_xlabel("epoch"); axes[0].legend(); axes[0].grid(True, alpha=0.3)
 
-        # Dice-component loss train vs val
         axes[1].plot(epochs, self.history["train_dice_loss"], label="train", marker="o", markersize=3)
         axes[1].plot(epochs, self.history["val_dice_loss"],   label="val",   marker="s", markersize=3)
         axes[1].set_title("dice loss"); axes[1].set_xlabel("epoch"); axes[1].legend(); axes[1].grid(True, alpha=0.3)
 
-        # Region-overlap val metrics (pixel-level Dice, IoU, and clDice).
-        # clDice and Dice differ when predictions are correctly *placed* but
-        # *disconnected*: Dice stays high, clDice drops.
         axes[2].plot(epochs, self.history["val_dice"],   label="dice",   marker="o", markersize=3)
         axes[2].plot(epochs, self.history["val_iou"],    label="iou",    marker="s", markersize=3)
         axes[2].plot(epochs, self.history["val_cldice"], label="clDice", marker="^", markersize=3)
         axes[2].set_title("val region metrics")
         axes[2].set_xlabel("epoch"); axes[2].legend(); axes[2].set_ylim(0, 1); axes[2].grid(True, alpha=0.3)
 
-        # Length recovery — the deployment-aligned metric.
-        # Ratio of 1.0 = exact length recovered. The IQR bands are p25–p75
-        # across val tiles for each ratio variant. Pixel ratio is sensitive
-        # to width; skeleton ratio is width-invariant.
         ax = axes[3]
         for name, color in (("pixel", "C0"), ("skel", "C1")):
             mean = self.history[f"val_length_ratio_{name}_mean"]
@@ -347,10 +371,16 @@ class SegTrainer:
                 self.best_val_loss = val_metrics["total"]
                 improved = True
         if improved:
+            # Unwrap DDP before saving so the checkpoint loads cleanly
+            # under both DDP and single-GPU later.
+            state_dict = (
+                self.model.module.state_dict() if hasattr(self.model, "module")
+                else self.model.state_dict()
+            )
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": self.model.state_dict(),
+                    "model_state_dict": state_dict,
                     "val_dice":  val_metrics["dice"],
                     "val_iou":   val_metrics["iou"],
                     "val_total": val_metrics["total"],
@@ -365,38 +395,48 @@ class SegTrainer:
 
     def run(self) -> None:
         for epoch in range(1, self.config.epochs + 1):
-            print(f"\n=== epoch {epoch}/{self.config.epochs} ===")
-            train_metrics = self.train_epoch()
+            if _is_rank_zero():
+                print(f"\n=== epoch {epoch}/{self.config.epochs} ===")
+            train_metrics = self.train_epoch(epoch)
             val_metrics   = self.val_epoch(epoch)
 
-            print(
-                f"  train: total={train_metrics['total']:.4f}  "
-                f"dice_loss={train_metrics['dice_loss']:.4f}"
-            )
-            print(
-                f"  val:   total={val_metrics['total']:.4f}  "
-                f"dice_loss={val_metrics['dice_loss']:.4f}  "
-                f"dice={val_metrics['dice']:.4f}  iou={val_metrics['iou']:.4f}  "
-                f"cldice={val_metrics['cldice']:.4f}"
-            )
-            # Length-ratio summary: 1.0 = perfect length recovery; pixel
-            # ratio is width-sensitive, skeleton ratio is width-invariant.
-            print(
-                f"  len:   pixel={val_metrics['length_ratio_pixel_mean']:.3f} "
-                f"(median {val_metrics['length_ratio_pixel_median']:.3f})  "
-                f"skeleton={val_metrics['length_ratio_skel_mean']:.3f} "
-                f"(median {val_metrics['length_ratio_skel_median']:.3f})"
-            )
+            if _is_rank_zero():
+                print(
+                    f"  train: total={train_metrics['total']:.4f}  "
+                    f"dice_loss={train_metrics['dice_loss']:.4f}"
+                )
+                print(
+                    f"  val:   total={val_metrics['total']:.4f}  "
+                    f"dice_loss={val_metrics['dice_loss']:.4f}  "
+                    f"dice={val_metrics['dice']:.4f}  iou={val_metrics['iou']:.4f}  "
+                    f"cldice={val_metrics['cldice']:.4f}"
+                )
+                print(
+                    f"  len:   pixel={val_metrics['length_ratio_pixel_mean']:.3f} "
+                    f"(median {val_metrics['length_ratio_pixel_median']:.3f})  "
+                    f"skeleton={val_metrics['length_ratio_skel_mean']:.3f} "
+                    f"(median {val_metrics['length_ratio_skel_median']:.3f})"
+                )
 
-            improved = self._maybe_save_best(epoch, val_metrics)
-            if improved:
-                print(f"  saved best → {self.save_dir / 'best.pth'}")
+            # Checkpoint + history writes ONLY on rank 0 to avoid races.
+            if _is_rank_zero():
+                improved = self._maybe_save_best(epoch, val_metrics)
+                if improved:
+                    print(f"  saved best → {self.save_dir / 'best.pth'}")
+                state_dict = (
+                    self.model.module.state_dict() if hasattr(self.model, "module")
+                    else self.model.state_dict()
+                )
+                torch.save(
+                    {"epoch": epoch, "model_state_dict": state_dict},
+                    self.save_dir / "last.pth",
+                )
+                self._update_history(train_metrics, val_metrics)
+                self._save_history()
+                self._save_plots()
 
-            torch.save(
-                {"epoch": epoch, "model_state_dict": self.model.state_dict()},
-                self.save_dir / "last.pth",
-            )
-
-            self._update_history(train_metrics, val_metrics)
-            self._save_history()
-            self._save_plots()
+            # Barrier so all ranks start the next epoch together (and so
+            # rank 0's checkpoint write fully completes before any rank
+            # might try to read it in a subsequent run).
+            if _ddp_active():
+                dist.barrier()

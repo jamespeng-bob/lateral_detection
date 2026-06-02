@@ -11,10 +11,11 @@ model:
   encoder: tu-efficientnet_b3
 
 training:
-  # EfficientNet-B3 OOMs at bs=8 on a 32 GB GPU — depthwise convs + SE blocks
-  # save more intermediate activations per layer than ResNet, and at 1024^2
-  # that adds up fast. bs=4 matches v1's batch and fits comfortably (~8-9 GB).
-  # Adds slight comparison impurity vs v2b (which fits at bs=8), but the
-  # encoder effect should dominate the batch-size effect.
+  # PER-GPU batch size. EfficientNet-B3 OOMs at bs=8 on a single 32 GB GPU
+  # (depthwise + SE blocks save many intermediate activations at 1024^2).
+  # Under DDP with world_size=2, effective bs = 4 * 2 = 8, matching v2b
+  # for an apples-to-apples encoder comparison. Launch with:
+  #   torchrun --nproc-per-node=2 --master-port=29500 train.py \
+  #       --overlay configs/train_v2a.yaml
   batch_size: 4
   save_dir: runs/v2a_effb3_bcedice
