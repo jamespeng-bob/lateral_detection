@@ -1,30 +1,17 @@
-# --- CUDA-enabled PyTorch ----------------------------------------------------
-# On Linux this pulls the CUDA wheel from the PyTorch index automatically.
-# On macOS the URL has no Darwin wheels, so pip silently falls back to PyPI
-# and installs the regular CPU/MPS wheel — no action needed there.
+# Python dependencies for lateral_detection — pure-Python only.
 #
-# Pick the URL that matches BOTH your driver's CUDA version AND your GPU's
-# compute capability. Full matrix: https://pytorch.org/get-started/locally/
-#   cu118  →  CUDA 11.8 driver, sm_50 .. sm_90 (Maxwell .. Hopper)
-#   cu121  →  CUDA 12.1 driver, sm_50 .. sm_90
-#   cu124  →  CUDA 12.4 driver, sm_50 .. sm_90
-#   cu126  →  CUDA 12.6 driver, sm_50 .. sm_90
-#   cu128  →  CUDA 12.8 driver, sm_50 .. sm_120  (Blackwell: RTX 50-series, B100, etc.)
-#   cu130  →  CUDA 13.0 driver, sm_75 .. sm_120
+# torch + torchvision are NOT pinned here. Their wheel availability depends
+# on the host's CUDA driver, and pinning a single `--index-url` here would
+# break on at least one of our servers (cu128 wheels need a 12.8+ driver;
+# the rtx6000 server is on 12.4). Install torch first, then this file:
 #
-# Check your server with:
-#   `nvidia-smi`                                   → driver CUDA version
-#   `python -c "import torch; print(torch.cuda.get_device_capability(0))"`
-#                                                  → (major, minor) compute capability
-# RTX 5090 / 5080 etc. are sm_120 → need cu128 or cu130. Older GPUs work with
-# any cu* wheel.
+#     source .venv/bin/activate
+#     bash scripts/install_torch.sh        # auto-picks cu* wheel for the driver
+#     pip install -r requirements.txt
 #
-# NOTE: must be `--index-url`, not `--extra-index-url`. Otherwise pip can
-# silently fall back to the cu130 wheel on PyPI and you get a CUDA driver
-# mismatch at `torch.cuda.is_available()`.
---index-url https://download.pytorch.org/whl/cu128
---extra-index-url https://pypi.org/simple
-# -----------------------------------------------------------------------------
+# Servers currently targeted:
+#   bobyard-server-5090   driver 12.8   →   cu128 wheels   (torch 2.9.x)
+#   bobyard-server-6000   driver 12.4   →   cu124 wheels   (torch 2.6.x latest)
 
 # Core
 numpy>=1.26
@@ -34,13 +21,7 @@ pyyaml>=6.0
 tqdm>=4.66
 scikit-image>=0.22   # skimage.morphology.skeletonize for clDice + length-ratio metrics
 
-# Deep learning
-# torch / torchvision are pinned to the highest pair the cu128 index ships
-# for Python 3.13 (verified: https://download.pytorch.org/whl/cu128/torch/).
-# Newer torch (2.10+) is only published with cu130 wheels. If you switch
-# CUDA versions above, bump these too (or relax to >= and let pip pick).
-torch==2.9.1
-torchvision==0.24.1
+# Deep learning (torch + torchvision installed by scripts/install_torch.sh)
 segmentation-models-pytorch>=0.3.4
 
 # Notebook (data inspection)

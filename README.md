@@ -46,14 +46,22 @@ lateral_detection/
 
 ## Setup
 
+Two-step install because torch's CUDA wheel needs to match the host's driver
+(see `scripts/install_torch.sh` for the auto-detection logic).
+
 ```bash
 # On macOS, system Python is exposed as `python3`. Use it only to bootstrap
-# the virtual environment — once activated, the venv provides plain
-# `python` / `pip`.
+# the venv — once activated, the venv provides plain `python` / `pip`.
 python3 -m venv .venv
 source .venv/bin/activate
+pip install --upgrade pip wheel
 
-pip install --upgrade pip
+# Step 1: install torch + torchvision for THIS host.
+# Auto-detects driver CUDA via nvidia-smi (cu128 for the 5090 server,
+# cu124 for the rtx6000 server, CPU on macOS).
+bash scripts/install_torch.sh
+
+# Step 2: install everything else (pure-Python deps).
 pip install -r requirements.txt
 
 # Strip notebook outputs from git so diffs stay small.
@@ -69,17 +77,17 @@ nbstripout --install
 ### Deploying to a Linux GPU server
 
 The codebase is portable: every path is built with `pathlib.Path`, no absolute
-paths anywhere, line-ending agnostic. Two server-specific tips:
+paths anywhere, line-ending agnostic. The two-step install above works on any
+GPU server without edits — `install_torch.sh` reads `nvidia-smi` and selects
+the matching wheel index. Two server-specific tips after that:
 
 ```bash
-# 1) Install a CUDA-enabled PyTorch wheel BEFORE the rest. Pick the cu121 /
-#    cu124 / etc. index URL that matches your driver:
-#    https://pytorch.org/get-started/locally/
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements.txt
-
-# 2) Bump DataLoader workers for the box's CPU count
+# 1) Increase DataLoader workers to match the box's CPU count
 #    (edit configs/train.yaml: training.num_workers).
+# 2) Use tmux so SSH disconnects don't kill training:
+#    tmux new -s train
+#    bash scripts/run_v2_ladder_parallel.sh        # or `python train.py ...`
+#    # Ctrl-B then D to detach
 ```
 
 Directory layout on the server must mirror local — `datasets/` sits *next to*

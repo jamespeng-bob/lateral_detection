@@ -56,19 +56,43 @@ see it appear under `git status` as staged, stop and tell the user.
 
 ## Environment pins (these matter)
 
-- **Server GPU**: 2× RTX 5090, compute capability **sm_120** (Blackwell).
-- **Server CUDA driver**: 12.8.
-- **PyTorch wheel**: must be **cu128**. cu126 and below lack sm_120 kernels;
-  cu130 requires a CUDA 13 driver we don't have.
-- **Pinned in `requirements.txt`**: `torch==2.9.1`, `torchvision==0.24.1` —
-  these are the highest pair the cu128 index ships for Python 3.13.
-  Do not bump unless `https://download.pytorch.org/whl/cu128/torch/` has been
-  re-checked.
-- **Server Python**: 3.13. **Local Python**: 3.9 (macOS system). Use
-  `from __future__ import annotations` everywhere so 3.10-style union types
-  don't break local imports.
-- **macOS bootstrap quirk**: the venv must be created with `python3 -m venv`,
-  not `python` (which doesn't exist on bare macOS).
+### Servers
+
+| alias | GPUs | driver | wheel | torch | python |
+|---|---|---|---|---|---|
+| `bobyard-server-5090` | 2× RTX 5090 (sm_120, 32 GB) | 12.8 | cu128 | 2.9.x | 3.13 |
+| `bobyard-server-6000` | 2× RTX 6000 Ada (sm_89, 48 GB) | 12.4 | cu124 | 2.6.x | 3.10 |
+
+The two servers run different torch versions because the cu124 wheel index
+caps out around torch 2.6 while cu128 ships up to 2.9. Don't try to unify
+them on a single pinned version — the constraint is the driver, and both
+drivers are pinned by the sysadmins.
+
+### Install procedure (any server)
+
+`requirements.txt` deliberately omits `torch` / `torchvision` / `--index-url`
+because pinning those would break on at least one server. Install in two
+steps:
+
+```bash
+source .venv/bin/activate
+bash scripts/install_torch.sh        # auto-detects driver → picks cu* wheel
+pip install -r requirements.txt      # pure-Python deps only
+```
+
+`install_torch.sh` parses `nvidia-smi`, converts "CUDA Version: 12.4" to
+`cu124`, and pulls torch from `https://download.pytorch.org/whl/cu124`.
+On macOS / CPU-only hosts it falls back to the CPU wheel. To force a
+specific index (post driver upgrade, reproducibility, etc.), pass it as
+the first argument: `bash scripts/install_torch.sh cu124`.
+
+### Python version
+
+- **Local (macOS)**: 3.9 system Python. Bootstrap with `python3 -m venv`
+  (not `python`, which doesn't exist on bare macOS).
+- **Server**: 3.13 (5090) or 3.10 (6000).
+- **Code requirement**: always `from __future__ import annotations` so
+  3.10-style union types don't break Python 3.9 imports locally.
 
 ---
 
