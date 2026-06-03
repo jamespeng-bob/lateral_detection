@@ -1,0 +1,19 @@
+# v2c re-run on bobyard-server-6000 — single-GPU, bs=8.
+#
+# MiT-B2's attention is O(N^2) memory in the spatial token count, so at
+# 1024^2 input the per-sample activation memory is much higher than CNNs.
+# On the 5090 (32 GB) it OOM'd at bs=8; extrapolating to 50 GB, bs=16
+# would still want ~50-64 GB → not safe. bs=8 fits with comfortable
+# headroom and matches v2a_6k's batch size.
+#
+# bs=8 is still 2x the 5090 v2c run (bs=4 via DDP, which was the only way
+# we could get it close to v2b's effective bs=8 on the smaller cards).
+# Single-GPU here is functionally equivalent regardless — MiT-B2 uses
+# LayerNorm only, so SyncBN was never a concern for this encoder.
+
+model:
+  encoder: mit_b2
+
+training:
+  batch_size: 8
+  save_dir:  runs/v2c_mitb2_bcedice_6k

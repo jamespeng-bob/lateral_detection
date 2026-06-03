@@ -1,0 +1,18 @@
+# v2b re-run on bobyard-server-6000 — single-GPU, bs=16.
+#
+# HGNetv2-B4 fits comfortably at bs=16 single-GPU on the 50 GB card
+# (verified at run launch: first epoch completed at ~3.5 min/epoch, no OOM).
+# bs=16 is 2x the 5090 v2b run (bs=8). Tests whether the larger batch
+# (lower gradient-estimation noise) improves the current front-runner
+# encoder's dice and/or length-tail beyond what we saw at bs=8.
+#
+# lr is INTENTIONALLY left at 1.0e-4 (same as original v2b bs=8) so the
+# only axis of variation is batch size — no lr scaling rule applied. An
+# lr sweep belongs in v3, not in a v2 batch-size scan.
+
+model:
+  encoder: tu-hgnetv2_b4
+
+training:
+  batch_size: 16
+  save_dir:  runs/v2b_hgnetv2b4_bcedice_6k

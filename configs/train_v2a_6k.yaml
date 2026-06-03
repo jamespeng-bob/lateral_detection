@@ -1,0 +1,21 @@
+# v2a re-run on bobyard-server-6000 — single-GPU, bs=8.
+#
+# bs=16 was attempted first but OOM'd in the first epoch: EfficientNet-B3's
+# depthwise + squeeze-excitation activations at 1024^2, bs=16 need >47 GB.
+# The 6000 has 50 GB per card so bs=8 is comfortable (~25 GB peak by
+# extrapolation, well under the limit).
+#
+# bs=8 is still 2x the 5090 v2a run, which was bs=4 because of 32 GB OOM at
+# bs=8. Combined with single-GPU (no SyncBN/DDP gotcha), this is the cleanest
+# v2a we can get — same data and same lr as the original v2b bs=8, only the
+# encoder differs.
+#
+# save_dir is suffixed `_6k` to make clear which server produced this
+# checkpoint and preserve the original `runs/v2a_effb3_bcedice/` on the 5090.
+
+model:
+  encoder: tu-efficientnet_b3
+
+training:
+  batch_size: 8
+  save_dir:  runs/v2a_effb3_bcedice_6k
