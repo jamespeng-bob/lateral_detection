@@ -277,11 +277,24 @@ def main() -> int:
     model = build_model(cfg["model"]).to(device)
 
     if world_size > 1:
-        # Sync BatchNorm running stats across ranks so the running mean/var
-        # are computed on the global effective batch, not just one rank's
-        # shard. Without this, BN stats would be on per-GPU bs=4 while v2b
-        # (the comparison baseline) trained on bs=8.
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        # SyncBN sounds like "always the right thing under DDP", but for
+        # encoders with many small BN layers (EfficientNet's depthwise +
+        # squeeze-excitation, MobileNet, etc.) it can degrade training
+        # noticeably at small per-rank batch sizes — the cross-rank
+        # variance estimate becomes noisy on thin tensors, and EfficientNet
+        # in particular is famously BN-sensitive. v2a-ddp lost ~20 dice
+        # points relative to its single-GPU baseline when SyncBN was on;
+        # without it (per-rank BN on bs=4 like the original single-GPU
+        # run) the same encoder trained cleanly. So: opt-in, default on
+        # for backward compatibility, override to false for any encoder
+        # that struggles. Encoders that use LayerNorm everywhere (MiT /
+        # SegFormer, Swin, ConvNeXt) are unaffected either way because
+        # convert_sync_batchnorm finds nothing to convert.
+        use_sync_bn = bool(cfg["training"].get("sync_batch_norm", True))
+        if use_sync_bn:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if is_rank_zero:
+            print(f"[train] DDP: sync_batch_norm={use_sync_bn}")
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank,
             find_unused_parameters=False,

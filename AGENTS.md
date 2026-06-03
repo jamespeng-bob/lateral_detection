@@ -78,9 +78,14 @@ see it appear under `git status` as staged, stop and tell the user.
 - DDP (multi-GPU on one host):
       `torchrun --nproc-per-node=2 --master-port=29500 train.py --overlay configs/<exp>.yaml`
 - `training.batch_size` in any config is **per-GPU**. Effective global
-  batch under DDP = `batch_size * world_size`. SyncBatchNorm is enabled
-  automatically when `world_size > 1` so BN running stats are computed
-  on the global effective batch.
+  batch under DDP = `batch_size * world_size`.
+- `training.sync_batch_norm` controls whether BN layers are converted to
+  SyncBatchNorm under DDP. Default `true`. **Override to `false` for any
+  encoder with many small BN layers** (EfficientNet, MobileNet, anything
+  with depthwise convs + squeeze-excitation). SyncBN on small per-rank
+  tensors gives noisy variance estimates that degrade training — v2a-ddp
+  with SyncBN got dice=0.6059 vs 0.8196 single-GPU. LayerNorm-only
+  encoders (MiT/SegFormer, Swin, ConvNeXt) are unaffected.
 - Use a different `--master-port` per concurrent torchrun (rapid
   sequential launches occasionally fail to release the port in time).
 

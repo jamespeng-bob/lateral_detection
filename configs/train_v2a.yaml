@@ -18,4 +18,14 @@ training:
   #   torchrun --nproc-per-node=2 --master-port=29500 train.py \
   #       --overlay configs/train_v2a.yaml
   batch_size: 4
-  save_dir: runs/v2a_effb3_bcedice
+
+  # Disable SyncBN for EfficientNet (see comment in configs/train.yaml).
+  # An earlier DDP+SyncBN run of this exact config tanked to dice=0.6059
+  # vs the single-GPU baseline of 0.8196 — leaving BN per-rank at bs=4
+  # matches the single-GPU run's BN setup exactly.
+  sync_batch_norm: false
+
+  # The previous DDP+SyncBN run (broken, dice=0.6059) lives at
+  # runs/v2a_effb3_bcedice_ddp_syncbn_broken — keeping the no-SyncBN DDP
+  # rerun in its own directory so we don't conflate the two.
+  save_dir: runs/v2a_effb3_bcedice_ddp_nosyncbn

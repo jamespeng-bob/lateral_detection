@@ -64,3 +64,14 @@ training:
   log_interval: 20
   val_viz_count: 4
   best_metric: dice               # dice | loss
+
+  # Under DDP only: if true, BatchNorm layers are converted to SyncBatchNorm
+  # so running mean/var are computed over the global effective batch. Sounds
+  # like always-correct, but for encoders with many small BN layers (notably
+  # EfficientNet's depthwise + SE blocks) it can DEGRADE training at small
+  # per-rank batch sizes — the cross-rank variance estimate becomes noisy
+  # on thin tensors. v2a's DDP run lost ~20 dice points with this on; without
+  # it, the same encoder trained cleanly. Override to false in any overlay
+  # where that's a concern (see configs/train_v2a.yaml). For LayerNorm-only
+  # encoders (MiT/SegFormer, Swin, ConvNeXt) the flag is a no-op.
+  sync_batch_norm: true
