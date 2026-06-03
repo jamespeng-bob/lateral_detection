@@ -54,7 +54,16 @@ training:
   # and those encoders save more intermediate tensors than ResNet does.
   # bs=8 fits all three v2 variants on a 32 GB GPU with comfortable headroom.
   batch_size:  8
-  num_workers: 4
+  # DataLoader workers per training process. Empirically, bs=8/16 on the
+  # 6000 with num_workers=4 leaves both GPUs at ~80W idle between batches
+  # (data pipeline bottleneck — `nvidia-smi dmon` shows SM bouncing
+  # 100→0→100). The 6000 has 32 CPU cores and was running at 66% idle, so
+  # we can comfortably bump this. num_workers=12 saturates 1 GPU on its
+  # own and stays safe at 2 parallel jobs (12*2=24 workers on 32 cores,
+  # plus headroom for the python main processes). The 5090 server has 16
+  # cores — if a 5090 run shows lots of swap or load, lower this via an
+  # overlay (e.g. configs/server_5090.yaml).
+  num_workers: 12
   epochs:      80
   lr:          1.0e-4
   weight_decay: 1.0e-4
