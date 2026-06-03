@@ -57,11 +57,20 @@ training:
   # DataLoader workers per training process. Empirically, bs=8/16 on the
   # 6000 with num_workers=4 leaves both GPUs at ~80W idle between batches
   # (data pipeline bottleneck — `nvidia-smi dmon` shows SM bouncing
-  # 100→0→100). The 6000 has 32 CPU cores and was running at 66% idle, so
-  # we can comfortably bump this. num_workers=12 saturates 1 GPU on its
-  # own and stays safe at 2 parallel jobs (12*2=24 workers on 32 cores,
-  # plus headroom for the python main processes). The 5090 server has 16
-  # cores — if a 5090 run shows lots of swap or load, lower this via an
+  # 100→0→100). num_workers=12 keeps both GPUs fed.
+  #
+  # CPU topology of the 6000: AMD Ryzen Threadripper PRO 5955WX, 1 socket,
+  # 16 physical cores, 2 SMT threads/core → 32 logical CPUs (`nproc`). Our
+  # data prep is mostly compute-bound (libpng decode, cv2 rasterize), so
+  # the effective parallel slots are closer to 16-20, not 32.
+  #
+  #   single-job run    :  12 workers on 16 cores → comfortable
+  #   2 parallel jobs   :  24 workers on 16 cores, leaning on SMT → some
+  #                        contention but absorbed, still much better than 4
+  #   ≥3 parallel jobs  :  lower this to 8 or use a per-job CLI override
+  #
+  # The 5090 server has 16 logical CPUs total (probably 8 cores × 2 SMT) —
+  # if a 5090 run shows swap pressure or load > 1.5, override via an
   # overlay (e.g. configs/server_5090.yaml).
   num_workers: 12
   epochs:      80
