@@ -1,0 +1,33 @@
+# v3a-c — MiT-B2 + BCE+Dice+clDice + cosine LR + 120 epochs (6000).
+#
+# Mirror of v3a-b but on the mit_b2 encoder. v2c_6k won on overlap
+# metrics (dice/iou/cldice) but had a heavier length tail than v2b_6k.
+# The hypothesis: clDice — by directly optimizing skeleton overlap —
+# pulls v2c's length tail closer to v2b's while preserving v2c's
+# overlap advantage. If it does, v3a-c becomes a single-best-of-all
+# model. If it doesn't, the encoder ranking from v2 stays put.
+#
+# MiT-B2's O(N^2) attention forces bs=8 on this card (vs bs=16 for HGNet).
+# Other knobs are identical to v3a-b so the only varying axis between
+# v3a-b and v3a-c is the encoder.
+
+model:
+  encoder: mit_b2
+
+training:
+  batch_size:    8
+  epochs:        120
+  lr:            1.0e-4
+  lr_schedule:   cosine
+  warmup_epochs: 5
+  cosine_min_lr_ratio: 0.01
+  save_dir: runs/v3a_mitb2_bcedice_cldice_6k
+
+loss:
+  name:          composite
+  bce_pos_weight: 1.0
+  dice_weight:   1.0
+  cldice_weight: 0.5
+  cldice_warmup: 5
+  cldice_iter:   3
+  lovasz_weight: 0.0

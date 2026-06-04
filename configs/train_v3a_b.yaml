@@ -1,0 +1,41 @@
+# v3a-b — HGNetv2-B4 + BCE+Dice+clDice + cosine LR + 120 epochs (6000).
+#
+# Builds on v2b_6k (which won on length tail). The hypothesis: adding a
+# topology-aware loss term (clDice) directly addresses the length-tail
+# axis where v2b was already best, and the longer cosine-LR schedule
+# unlocks the headroom we saw at epoch 80 (v2b was still improving).
+#
+# Why these specific knobs:
+# - bs=16:               same as v2b_6k. Fits ~42 GB on the 50 GB card.
+# - epochs=120:          v2b_6k peaked at epoch 80 (final) — still rising.
+#                        +50% epochs lets cosine LR do its work.
+# - lr=1e-4 + cosine:    same peak lr as v2b_6k, but anneals 1e-4 → 1e-6.
+#                        Standard segmentation recipe; usually +0.3-0.7 dice.
+# - warmup_epochs=5:     short linear warmup so early aux losses don't
+#                        derail an unstable model.
+# - cldice_weight=0.5:   the clDice paper's recommended weight when paired
+#                        with Dice+BCE for tubular structures.
+# - cldice_warmup=5:     ramp clDice in over first 5 epochs. Avoids the
+#                        topology loss seeing nearly-uniform predictions
+#                        (skel of those is noisy and gives bad gradients).
+
+model:
+  encoder: tu-hgnetv2_b4
+
+training:
+  batch_size:    16
+  epochs:        120
+  lr:            1.0e-4
+  lr_schedule:   cosine
+  warmup_epochs: 5
+  cosine_min_lr_ratio: 0.01
+  save_dir: runs/v3a_hgnetv2b4_bcedice_cldice_6k
+
+loss:
+  name:          composite
+  bce_pos_weight: 1.0
+  dice_weight:   1.0
+  cldice_weight: 0.5
+  cldice_warmup: 5
+  cldice_iter:   3
+  lovasz_weight: 0.0      # disabled in v3a; enabled in v3b

@@ -16,6 +16,7 @@ Single-GPU runs work unchanged — every DDP check short-circuits.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +53,14 @@ class TrainerConfig:
     device: str = "cuda"
     best_metric: str = "dice"   # 'dice' or 'loss'
 
+    # LR schedule. 'constant' = no scheduler (use config.lr throughout, matches
+    # the v1/v2 baselines). 'cosine' = linear warmup for `warmup_epochs`, then
+    # cosine anneal from config.lr to config.lr * cosine_min_lr_ratio over the
+    # remaining epochs. Pass `warmup_epochs=0` to skip warmup.
+    lr_schedule: str = "constant"   # 'constant' | 'cosine'
+    warmup_epochs: int = 0
+    cosine_min_lr_ratio: float = 0.01
+
 
 # ---------------------------------------------------------------------------
 # DDP helpers (mirrors metrics.py — defined here too so the trainer doesn't
@@ -79,6 +88,37 @@ def _all_reduce_mean(value: float) -> float:
     t = torch.tensor([float(value)], device=device, dtype=torch.float64)
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return float((t / dist.get_world_size()).item())
+
+
+def _build_lr_scheduler(
+    optimizer: optim.Optimizer,
+    schedule: str,
+    total_epochs: int,
+    warmup_epochs: int,
+    cosine_min_lr_ratio: float,
+) -> optim.lr_scheduler._LRScheduler | None:
+    """Build a per-epoch LR scheduler. None for 'constant' (no-op).
+
+    Cosine: linear warmup from 0 to base_lr over ``warmup_epochs``, then
+    cosine anneal from base_lr to ``base_lr * cosine_min_lr_ratio`` over
+    the remaining ``total_epochs - warmup_epochs`` epochs. ``epoch`` arg
+    of ``lr_lambda`` is 0-indexed (matches PyTorch's LambdaLR convention).
+    """
+    if schedule == "constant":
+        return None
+    if schedule != "cosine":
+        raise ValueError(f"Unknown lr_schedule: {schedule!r}")
+
+    def lr_lambda(epoch: int) -> float:
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            # Linear warmup: epoch 0 → lr * 1/warmup, epoch (warmup-1) → lr * 1.
+            return float(epoch + 1) / float(warmup_epochs)
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return cosine_min_lr_ratio + (1.0 - cosine_min_lr_ratio) * cosine
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +160,15 @@ class SegTrainer:
             weight_decay=float(config.weight_decay),
         )
 
+        # Optional LR scheduler. Stepped once per epoch (not per batch).
+        self.lr_scheduler = _build_lr_scheduler(
+            self.optimizer,
+            schedule=config.lr_schedule,
+            total_epochs=config.epochs,
+            warmup_epochs=config.warmup_epochs,
+            cosine_min_lr_ratio=config.cosine_min_lr_ratio,
+        )
+
         self.save_dir = Path(config.save_dir)
         if _is_rank_zero():
             self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +192,7 @@ class SegTrainer:
             "val_length_ratio_skel_median":  [],
             "val_length_ratio_skel_p25":     [],
             "val_length_ratio_skel_p75":     [],
+            "lr":              [],
         }
         self.best_val_dice = -1.0
         self.best_val_loss = float("inf")
@@ -307,7 +357,7 @@ class SegTrainer:
     # History + checkpoints (rank 0 only)
     # ------------------------------------------------------------------
 
-    def _update_history(self, train_metrics: dict, val_metrics: dict) -> None:
+    def _update_history(self, train_metrics: dict, val_metrics: dict, lr: float = float("nan")) -> None:
         self.history["train_total"].append(train_metrics["total"])
         self.history["train_dice_loss"].append(train_metrics["dice_loss"])
         self.history["val_total"].append(val_metrics["total"])
@@ -322,6 +372,7 @@ class SegTrainer:
             "length_ratio_skel_p25",   "length_ratio_skel_p75",
         ):
             self.history[f"val_{key}"].append(val_metrics.get(key, float("nan")))
+        self.history["lr"].append(float(lr))
 
     def _save_history(self) -> None:
         (self.save_dir / "history.json").write_text(json.dumps(self.history, indent=2))
@@ -395,8 +446,18 @@ class SegTrainer:
 
     def run(self) -> None:
         for epoch in range(1, self.config.epochs + 1):
+            # Notify the criterion of the current epoch so composite losses
+            # can ramp aux weights through their warmup. Plain BCEDice /
+            # FocalDice don't have set_epoch — that's fine, no-op.
+            if hasattr(self.criterion, "set_epoch"):
+                self.criterion.set_epoch(epoch)
+
+            # Current LR (for logging). On the first epoch this is config.lr
+            # unmodified; under cosine+warmup it ramps up then decays.
+            current_lr = float(self.optimizer.param_groups[0]["lr"])
+
             if _is_rank_zero():
-                print(f"\n=== epoch {epoch}/{self.config.epochs} ===")
+                print(f"\n=== epoch {epoch}/{self.config.epochs}   lr={current_lr:.2e} ===")
             train_metrics = self.train_epoch(epoch)
             val_metrics   = self.val_epoch(epoch)
 
@@ -431,9 +492,14 @@ class SegTrainer:
                     {"epoch": epoch, "model_state_dict": state_dict},
                     self.save_dir / "last.pth",
                 )
-                self._update_history(train_metrics, val_metrics)
+                self._update_history(train_metrics, val_metrics, lr=current_lr)
                 self._save_history()
                 self._save_plots()
+
+            # Step LR scheduler AFTER the epoch is finished (so the lr we
+            # logged was the lr actually used for this epoch's gradients).
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
 
             # Barrier so all ranks start the next epoch together (and so
             # rank 0's checkpoint write fully completes before any rank

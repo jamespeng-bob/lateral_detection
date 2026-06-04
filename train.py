@@ -313,6 +313,9 @@ def main() -> int:
         val_viz_count=int(cfg["training"]["val_viz_count"]),
         device=device,
         best_metric=str(cfg["training"]["best_metric"]),
+        lr_schedule=str(cfg["training"].get("lr_schedule", "constant")),
+        warmup_epochs=int(cfg["training"].get("warmup_epochs", 0)),
+        cosine_min_lr_ratio=float(cfg["training"].get("cosine_min_lr_ratio", 0.01)),
     )
 
     if is_rank_zero:

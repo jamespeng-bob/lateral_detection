@@ -1,0 +1,34 @@
+# v3b-c — MiT-B2 + BCE+Dice+Lovász+clDice (composite) + cosine + 120 epochs.
+#
+# Mirror of v3b-b but on mit_b2. Same loss recipe and training schedule;
+# only encoder + bs differs. With four v3 runs total we'll have a clean
+# 2 (encoders) × 2 (loss recipes) factorial:
+#
+#                          +clDice only     +Lovász+clDice
+#   hgnetv2_b4 (v3*-b)     v3a-b            v3b-b
+#   mit_b2     (v3*-c)     v3a-c            v3b-c
+#
+# This lets us read off whether the gains are encoder-specific or loss-
+# specific, and whether stacking Lovász on top of clDice is additive.
+
+model:
+  encoder: mit_b2
+
+training:
+  batch_size:    8
+  epochs:        120
+  lr:            1.0e-4
+  lr_schedule:   cosine
+  warmup_epochs: 5
+  cosine_min_lr_ratio: 0.01
+  save_dir: runs/v3b_mitb2_composite_6k
+
+loss:
+  name:          composite
+  bce_pos_weight: 1.0
+  dice_weight:   1.0
+  lovasz_weight: 0.3
+  lovasz_warmup: 5
+  cldice_weight: 0.5
+  cldice_warmup: 15
+  cldice_iter:   3

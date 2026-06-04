@@ -1,0 +1,36 @@
+# v3b-b — HGNetv2-B4 + BCE+Dice+Lovász+clDice (composite) + cosine + 120 epochs.
+#
+# Same encoder + bs + LR schedule + epoch budget as v3a-b. The only
+# difference vs v3a-b: also adds Lovász hinge (direct IoU surrogate).
+#
+# Composite recipe (inspired by the walls-segmentation reference):
+#   BCE + Dice + 0.3*Lovász + 0.5*clDice
+# with the two aux losses staggered in. Lovász ramps in over epochs
+# 1-5 (alongside dice), clDice ramps over epochs 5-15 (after Lovász
+# has stabilized). This staggered warmup avoids early instability.
+#
+# Hypothesis: Lovász improves boundary precision (IoU-style smoothing
+# at the line edge), clDice improves topology (length tail). Stacked,
+# they should beat either alone if their gradients are complementary.
+
+model:
+  encoder: tu-hgnetv2_b4
+
+training:
+  batch_size:    16
+  epochs:        120
+  lr:            1.0e-4
+  lr_schedule:   cosine
+  warmup_epochs: 5
+  cosine_min_lr_ratio: 0.01
+  save_dir: runs/v3b_hgnetv2b4_composite_6k
+
+loss:
+  name:          composite
+  bce_pos_weight: 1.0
+  dice_weight:   1.0
+  lovasz_weight: 0.3
+  lovasz_warmup: 5        # rampup over first 5 epochs (alongside lr warmup)
+  cldice_weight: 0.5
+  cldice_warmup: 15       # later rampup to let lovász stabilize first
+  cldice_iter:   3
