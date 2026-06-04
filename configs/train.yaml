@@ -54,25 +54,25 @@ training:
   # and those encoders save more intermediate tensors than ResNet does.
   # bs=8 fits all three v2 variants on a 32 GB GPU with comfortable headroom.
   batch_size:  8
-  # DataLoader workers per training process. Empirically, bs=8/16 on the
-  # 6000 with num_workers=4 leaves both GPUs at ~80W idle between batches
-  # (data pipeline bottleneck — `nvidia-smi dmon` shows SM bouncing
-  # 100→0→100). num_workers=12 keeps both GPUs fed.
+  # DataLoader workers per training process. The 6000 is a 16-physical-core
+  # Threadripper PRO 5955WX (32 logical w/ SMT). Optimal num_workers depends
+  # on whether the run is alone or sharing the box:
   #
-  # CPU topology of the 6000: AMD Ryzen Threadripper PRO 5955WX, 1 socket,
-  # 16 physical cores, 2 SMT threads/core → 32 logical CPUs (`nproc`). Our
-  # data prep is mostly compute-bound (libpng decode, cv2 rasterize), so
-  # the effective parallel slots are closer to 16-20, not 32.
+  #   single-job run    :  num_workers=12 → fills the CPU comfortably
+  #   2 parallel jobs   :  num_workers=6  → 12 workers total < 16 cores,
+  #                                         leaves headroom for OS + main pyproc
   #
-  #   single-job run    :  12 workers on 16 cores → comfortable
-  #   2 parallel jobs   :  24 workers on 16 cores, leaning on SMT → some
-  #                        contention but absorbed, still much better than 4
-  #   ≥3 parallel jobs  :  lower this to 8 or use a per-job CLI override
+  # Why default to 6 (the parallel-safe value): we mostly run 2-up ladders
+  # on this box. With num_workers=12 (24 worker procs on 16 cores), v3's
+  # composite-loss runs hit load avg ~25 and sustained GPU power ~90 W
+  # (vs ~250 W peak) — heavy CPU oversubscription, GPU starved on data.
+  # Dropping to 6 per job → load avg ~14 → GPU fed continuously → ~2x
+  # faster wall-clock for 2-up ladders.
   #
-  # The 5090 server has 16 logical CPUs total (probably 8 cores × 2 SMT) —
-  # if a 5090 run shows swap pressure or load > 1.5, override via an
-  # overlay (e.g. configs/server_5090.yaml).
-  num_workers: 12
+  # For single-job runs override via CLI (`--num-workers 12`) or a per-
+  # experiment overlay. The 5090 server is smaller (~8 cores × 2 SMT) and
+  # 6 is also safe there.
+  num_workers: 6
   epochs:      80
   lr:          1.0e-4
   weight_decay: 1.0e-4
