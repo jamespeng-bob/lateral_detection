@@ -158,18 +158,45 @@ class SymbolFilter:
         self,
         classifier: SymbolClassifier,
         *,
-        p_irr_thresh:    float = 0.85,
-        p_call_thresh:   float = 0.15,
-        dilation_px:     int   = 3,
-        endpoint_radius: int   = 25,
-        min_component_px: int  = 0,
+        p_irr_thresh:           float = 0.85,
+        p_call_thresh:          float = 0.15,
+        dilation_px:            int   = 3,
+        endpoint_radius:        int   = 25,
+        min_component_px:       int   = 0,
+        min_drop_skel_px:       int   = 0,
     ) -> None:
-        self.classifier      = classifier
-        self.p_irr_thresh    = float(p_irr_thresh)
-        self.p_call_thresh   = float(p_call_thresh)
-        self.dilation_px     = int(dilation_px)
-        self.endpoint_radius = int(endpoint_radius)
-        self.min_component_px = int(min_component_px)
+        """
+        Parameters
+        ----------
+        p_irr_thresh : float
+            A symbol's classifier P >= this → "irrigation". An endpoint touching
+            any such symbol KEEPS the component unconditionally.
+        p_call_thresh : float
+            A symbol's classifier P <= this → "non-irrigation" (callout etc.).
+            By itself doesn't drop; the full drop rule also requires no
+            irrigation endpoint AND skeleton length below ``min_drop_skel_px``.
+        dilation_px : int
+            Morphological dilation of the pred mask before component analysis,
+            to close hairline gaps.
+        endpoint_radius : int
+            How close a symbol's bbox center must be to a skeleton endpoint
+            to count as "touching" that endpoint.
+        min_component_px : int
+            Components smaller than this many AREA pixels are skipped entirely
+            (no decision recorded). Useful for noise.
+        min_drop_skel_px : int
+            Components are PROTECTED from being dropped if their SKELETON
+            (1-px-wide centerline) has at least this many pixels — i.e., the
+            line is long enough to be a real lateral, not a callout fragment.
+            Set to 0 to disable. Default 0 = no length-based protection.
+        """
+        self.classifier        = classifier
+        self.p_irr_thresh      = float(p_irr_thresh)
+        self.p_call_thresh     = float(p_call_thresh)
+        self.dilation_px       = int(dilation_px)
+        self.endpoint_radius   = int(endpoint_radius)
+        self.min_component_px  = int(min_component_px)
+        self.min_drop_skel_px  = int(min_drop_skel_px)
 
     # ------------------------------------------------------------------
 
@@ -290,8 +317,27 @@ class SymbolFilter:
             if any_irr:
                 decision.fate = "keep"; decision.reason = "irrigation_endpoint"
             elif any_call:
-                decision.fate = "drop"; decision.reason = "callout_endpoint_only"
-                drop_set.add(cid)
+                # Provisional drop — but check if the component is long enough
+                # to be a real lateral. Real laterals span hundreds of pixels;
+                # callout fragments are usually < ~100 px. Skeleton length is
+                # the right ruler because it's width-invariant.
+                if self.min_drop_skel_px > 0:
+                    skel_len = int(skel.sum())
+                else:
+                    skel_len = -1  # signal "not measured"
+                if self.min_drop_skel_px > 0 and skel_len >= self.min_drop_skel_px:
+                    decision.fate = "keep"
+                    decision.reason = (
+                        f"callout_endpoint_but_long_skel_{skel_len}>={self.min_drop_skel_px}"
+                    )
+                else:
+                    decision.fate = "drop"
+                    decision.reason = (
+                        "callout_endpoint_only"
+                        if skel_len < 0
+                        else f"callout_endpoint_short_skel_{skel_len}"
+                    )
+                    drop_set.add(cid)
             else:
                 decision.fate = "keep"; decision.reason = "no_strong_signal"
             decisions.append(decision)

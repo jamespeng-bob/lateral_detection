@@ -188,10 +188,15 @@ def main() -> int:
     parser.add_argument("--splits",      nargs="+", default=["valid"])
     parser.add_argument("--device",      default="cuda:0")
     parser.add_argument("--prob-thresh", type=float, default=0.5)
-    parser.add_argument("--p-irr-thresh",  type=float, default=0.85)
-    parser.add_argument("--p-call-thresh", type=float, default=0.15)
-    parser.add_argument("--dilation-px",     type=int, default=3)
-    parser.add_argument("--endpoint-radius", type=int, default=25)
+    parser.add_argument("--p-irr-thresh",     type=float, default=0.85)
+    parser.add_argument("--p-call-thresh",    type=float, default=0.05,
+                        help="Drop only on very-confident non-irrigation (was 0.15).")
+    parser.add_argument("--dilation-px",      type=int,   default=3)
+    parser.add_argument("--endpoint-radius",  type=int,   default=25)
+    parser.add_argument("--min-drop-skel-px", type=int,   default=150,
+                        help="Components with skeleton-length >= this are PROTECTED "
+                             "from being dropped (they're long enough to be real "
+                             "laterals, not callout fragments). Default 150.")
     parser.add_argument("--max-long-side",   type=int, default=1800)
     args = parser.parse_args()
 
@@ -215,10 +220,12 @@ def main() -> int:
         p_call_thresh=args.p_call_thresh,
         dilation_px=args.dilation_px,
         endpoint_radius=args.endpoint_radius,
+        min_drop_skel_px=args.min_drop_skel_px,
     )
-    print(f"[eval_filter] filter thresholds: P_irr>={args.p_irr_thresh}, "
+    print(f"[eval_filter] filter: P_irr>={args.p_irr_thresh}, "
           f"P_call<={args.p_call_thresh}, dilation={args.dilation_px}, "
-          f"endpoint_radius={args.endpoint_radius}")
+          f"endpoint_radius={args.endpoint_radius}, "
+          f"min_drop_skel_px={args.min_drop_skel_px}")
 
     norm = cfg["normalization"]
     mean = tuple(norm["mean"]); std = tuple(norm["std"])
