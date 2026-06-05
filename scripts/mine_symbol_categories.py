@@ -157,10 +157,22 @@ def cache_one_image(
         )
         near_gt: bool | None = None
         if dist_lookup is not None:
-            cx = int((x1 + x2) / 2.0)
-            cy = int((y1 + y2) / 2.0)
-            if 0 <= cy < H and 0 <= cx < W:
-                near_gt = bool(dist_lookup[cy, cx] < d_near)
+            # bbox-OVERLAP distance: a symbol is near_gt iff any pixel inside
+            # its bbox is within d_near of a GT line pixel. The previous
+            # bbox-CENTER variant was systematically biased against large
+            # symbols (valves, sprinklers): a 50px valve sitting on a lateral
+            # has its center ~25px from the line even though the bbox contains
+            # the line. Center-distance vs the same d_near would label such
+            # a valve as "not near GT" → it polluted the "ambiguous" clusters
+            # and the classifier never learned to recognize valves as
+            # irrigation. See scripts/recompute_near_gt.py for the rationale.
+            x1i = max(0, min(W - 1, int(x1)))
+            y1i = max(0, min(H - 1, int(y1)))
+            x2i = max(0, min(W - 1, int(x2)))
+            y2i = max(0, min(H - 1, int(y2)))
+            if x2i >= x1i and y2i >= y1i:
+                patch = dist_lookup[y1i : y2i + 1, x1i : x2i + 1]
+                near_gt = bool(patch.size > 0 and patch.min() < d_near)
             else:
                 near_gt = False
         symbols.append({
