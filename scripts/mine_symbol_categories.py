@@ -80,26 +80,44 @@ CLASSIFY_BATCH_SIZE = 64   # crop_ids per classify() call
 # ---------------------------------------------------------------------------
 
 
-def _near_gt_lookup(gt_mask: np.ndarray | None, d_near: int) -> np.ndarray | None:
-    """Distance-transform of (1 - GT). lookup[y,x] = distance to nearest GT px.
+def _bbox_pierces_gt(
+    gt_mask: np.ndarray | None,
+    x1: float, y1: float, x2: float, y2: float,
+    center_margin: float,
+) -> bool:
+    """Sword-and-apple criterion: line genuinely pierces the symbol.
 
-    None when there's no GT (e.g., empty annotation). At lookup time, a
-    symbol is near_gt if its bbox center has lookup value < d_near.
+    True iff any GT line pixel lies in the bbox's INNER region (the bbox
+    shrunk by ``center_margin`` on each side). With ``center_margin=0.30``,
+    inner region = central 40%% × 40%% of the bbox. Relative threshold so
+    it scales correctly across symbol sizes. See ``scripts/recompute_near_gt.py``
+    for the full rationale.
     """
     if gt_mask is None or not gt_mask.any():
-        return None
-    # cv2.distanceTransform wants 0 = foreground for its source convention;
-    # we want distance FROM each background pixel TO the nearest foreground
-    # pixel, so we invert: foreground = pixel == 0 in `inv`.
-    inv = (gt_mask == 0).astype(np.uint8)
-    return cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+        return False
+    H, W = gt_mask.shape
+    w = max(0.0, x2 - x1); h = max(0.0, y2 - y1)
+    if w <= 0 or h <= 0:
+        return False
+    inset_x = w * center_margin; inset_y = h * center_margin
+    ix1 = max(0, min(W, int(round(x1 + inset_x))))
+    iy1 = max(0, min(H, int(round(y1 + inset_y))))
+    ix2 = max(0, min(W, int(round(x2 - inset_x))))
+    iy2 = max(0, min(H, int(round(y2 - inset_y))))
+    if ix2 <= ix1 or iy2 <= iy1:
+        # Inner region collapsed for a tiny bbox — fall back to full bbox.
+        ix1 = max(0, int(x1)); iy1 = max(0, int(y1))
+        ix2 = min(W, int(x2) + 1); iy2 = min(H, int(y2) + 1)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return False
+    return bool(gt_mask[iy1:iy2, ix1:ix2].any())
 
 
 def cache_one_image(
     client: IsolatedSymbolClient,
     image_path: Path,
     gt_mask: np.ndarray | None,
-    d_near: int,
+    center_margin: float,
     out_json: Path,
 ) -> int:
     """Localize + classify one image, save to JSON. Returns symbol count.
@@ -139,10 +157,6 @@ def cache_one_image(
             if isinstance(res, dict) and "embedding" in res:
                 embeddings_by_id[cid] = [float(v) for v in res["embedding"]]
 
-    dist_lookup = _near_gt_lookup(gt_mask, d_near)
-    H = gt_mask.shape[0] if gt_mask is not None else None
-    W = gt_mask.shape[1] if gt_mask is not None else None
-
     symbols = []
     for d in dets:
         cid = str(d.get("id", ""))
@@ -155,26 +169,14 @@ def cache_one_image(
             float(d["x2"]),
             float(d["y2"]),
         )
-        near_gt: bool | None = None
-        if dist_lookup is not None:
-            # bbox-OVERLAP distance: a symbol is near_gt iff any pixel inside
-            # its bbox is within d_near of a GT line pixel. The previous
-            # bbox-CENTER variant was systematically biased against large
-            # symbols (valves, sprinklers): a 50px valve sitting on a lateral
-            # has its center ~25px from the line even though the bbox contains
-            # the line. Center-distance vs the same d_near would label such
-            # a valve as "not near GT" → it polluted the "ambiguous" clusters
-            # and the classifier never learned to recognize valves as
-            # irrigation. See scripts/recompute_near_gt.py for the rationale.
-            x1i = max(0, min(W - 1, int(x1)))
-            y1i = max(0, min(H - 1, int(y1)))
-            x2i = max(0, min(W - 1, int(x2)))
-            y2i = max(0, min(H - 1, int(y2)))
-            if x2i >= x1i and y2i >= y1i:
-                patch = dist_lookup[y1i : y2i + 1, x1i : x2i + 1]
-                near_gt = bool(patch.size > 0 and patch.min() < d_near)
-            else:
-                near_gt = False
+        # Sword-and-apple: True iff GT line pixel sits in the bbox's INNER
+        # region (relative threshold = bbox shrunk by `center_margin` per side).
+        # See scripts/recompute_near_gt.py for full rationale.
+        near_gt: bool | None
+        if gt_mask is None:
+            near_gt = None
+        else:
+            near_gt = _bbox_pierces_gt(gt_mask, x1, y1, x2, y2, center_margin)
         symbols.append({
             "id":   cid,
             "x1":   x1, "y1": y1, "x2": x2, "y2": y2,
@@ -400,8 +402,12 @@ def main() -> int:
     parser.add_argument("--out-dir",     default="results/symbol_categories")
     parser.add_argument("--k", type=int, default=30,
                         help="K for k-means. 0 = auto-pick via silhouette.")
-    parser.add_argument("--d-near", type=int, default=30,
-                        help="Pixel distance for a symbol to count as 'near GT line'.")
+    parser.add_argument("--center-margin", type=float, default=0.30,
+                        help="Fraction of each bbox side to crop off when "
+                             "checking if a GT line pixel lies in the bbox INNER "
+                             "region. Default 0.30 → inner region is central "
+                             "40%% × 40%% of the bbox. Relative threshold so it "
+                             "scales correctly across symbol sizes.")
     parser.add_argument("--p-irr-thresh",  type=float, default=0.7,
                         help="Cluster category 'irrigation' if P(near_gt) > this.")
     parser.add_argument("--p-call-thresh", type=float, default=0.2,
@@ -459,7 +465,7 @@ def main() -> int:
                 )
                 cache_path = cache_root / split / f"{Path(record.file_name).stem}.json"
                 n = cache_one_image(
-                    client, record.path, gt_mask, args.d_near, cache_path,
+                    client, record.path, gt_mask, args.center_margin, cache_path,
                 )
                 total_symbols += n
             print(f"  [{split}] cached {total_symbols} symbols across {len(items)} images")

@@ -1,26 +1,54 @@
 """Recompute per-symbol ``near_gt`` in the existing symbol cache.
 
-Why this exists
----------------
-The original ``mine_symbol_categories.py`` set ``near_gt`` using the bbox
-CENTER distance to the nearest GT lateral pixel. For LARGE symbols (valves,
-sprinklers — the irrigation-relevant ones) this is biased low: a 50×50 px
-valve sitting ON a lateral has its center ~20-25 px from the line even
-though the bbox literally contains the line. With ``d_near=30 px`` they
-ended up under-labeled, polluting the "ambiguous" cluster with real
-valves and teaching the classifier to predict low P for them. Downstream,
-the symbol filter then dropped real laterals whose endpoints touched
-these mis-classified valves.
+What "near_gt" should mean (sword-and-apple criterion)
+------------------------------------------------------
+A symbol is irrigation-related iff the GT lateral line either PASSES
+THROUGH the symbol (sword pierces apple through the middle) or ENDS
+inside the symbol (sword thrusts toward the center but doesn't pierce
+through). A line that GRAZES the symbol's edge (sword glances off the
+apple's surface) is NOT a real intersection.
 
-This script fixes that **without re-running the API** (which dominates
-the cost of mining). It walks the existing cache, re-computes ``near_gt``
-using bbox-OVERLAP distance (``min distance over pixels inside the bbox
-< d_near``), and writes the updated JSONs in place. Embeddings + bboxes
-+ ids are untouched.
+The previous heuristics didn't capture this:
 
-After this, you re-train the classifier and re-evaluate the filter:
+  v1 (bbox CENTER distance < d_near px):
+     Biased low for LARGE symbols. A 50×50 valve sitting on a lateral has
+     its center 20-25 px from the line even though the bbox contains the
+     line; with d_near=30 most large valves got mislabeled as not-near-GT.
 
-    python -m scripts.recompute_near_gt --d-near 10
+  v2 (any bbox pixel within d_near of GT — bbox overlap):
+     Captured large valves correctly, but: (a) used an ABSOLUTE pixel
+     threshold (unfair to symbols of different sizes), and (b) couldn't
+     distinguish "line pierces the symbol" from "line grazes the symbol
+     edge" — both fire near_gt=True even though only the first means
+     "the symbol is on the line".
+
+  v3 (THIS file — inner-region check):
+     A symbol is near_gt iff any GT line pixel lies within the bbox's
+     INNER REGION (the bbox shrunk by `center_margin` on each side).
+     Inner region = bbox shrunk to (1 - 2*center_margin) × (1 - 2*center_margin)
+     of original size, centered.
+
+     - center_margin=0.30 → inner is the central 40% × 40% of the bbox.
+     - Line piercing the center: hits inner region → near_gt=True ✓
+     - Line ending well inside the bbox: hits inner region → near_gt=True ✓
+     - Line grazing one bbox edge: all line pixels are in the OUTER ring,
+       none in the inner region → near_gt=False ✓
+     - Line ending exactly at bbox edge: borderline; if the line extends
+       into the bbox at all, may or may not reach the inner region
+       depending on geometry (this is the only case where we err
+       slightly conservative).
+
+     Threshold is RELATIVE to bbox size — same fraction works for tiny
+     callout boxes and large valves alike.
+
+What this script doesn't do
+---------------------------
+Doesn't change the EMBEDDINGS or bbox values in the cache. Only recomputes
+the boolean `near_gt` per symbol. No new API calls.
+
+Usage (re-run end-to-end after this):
+
+    python -m scripts.recompute_near_gt --center-margin 0.30
     python -m scripts.train_symbol_classifier ...
     python -m scripts.eval_symbol_filter ...
 """
@@ -32,7 +60,6 @@ import json
 import sys
 from pathlib import Path
 
-import cv2
 import numpy as np
 import yaml
 from tqdm import tqdm
@@ -47,31 +74,48 @@ from data.rasterize import rasterize_polylines
 from train import merge_configs
 
 
-def _bbox_near_gt(
-    dist_lookup: np.ndarray,
+def _bbox_near_gt_inner(
+    gt_mask: np.ndarray,
     x1: float, y1: float, x2: float, y2: float,
-    d_near: int,
+    center_margin: float,
 ) -> bool:
-    """True if any pixel inside the bbox is within ``d_near`` of a GT pixel.
+    """Sword-and-apple criterion: True iff any GT line pixel lies in the
+    bbox's INNER region (the bbox shrunk by ``center_margin`` on each side).
 
-    ``dist_lookup[y, x]`` is the L2 distance from pixel (y, x) to the
-    nearest GT-line pixel (computed once per image).
+    ``center_margin=0.30`` → inner region = central 40% × 40% of bbox.
+
+    A line that pierces the bbox (sword through apple's middle) has pixels
+    in the inner region; a line that just grazes an edge does not.
     """
-    H, W = dist_lookup.shape
-    x1i = max(0, min(W - 1, int(x1)))
-    y1i = max(0, min(H - 1, int(y1)))
-    x2i = max(0, min(W - 1, int(x2)))
-    y2i = max(0, min(H - 1, int(y2)))
-    if x2i < x1i or y2i < y1i:
+    H, W = gt_mask.shape
+    w = max(0.0, x2 - x1)
+    h = max(0.0, y2 - y1)
+    if w <= 0 or h <= 0:
         return False
-    patch = dist_lookup[y1i : y2i + 1, x1i : x2i + 1]
-    return bool(patch.size > 0 and patch.min() < d_near)
-
-
-def _near_gt_lookup(gt_mask: np.ndarray) -> np.ndarray:
-    """L2 distance transform of ``1 - gt_mask`` (0 on GT pixels, growing outward)."""
-    inv = (gt_mask == 0).astype(np.uint8)
-    return cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+    # Shrink bbox by `center_margin` of each side, from each side.
+    inset_x = w * center_margin
+    inset_y = h * center_margin
+    ix1 = int(round(x1 + inset_x))
+    iy1 = int(round(y1 + inset_y))
+    ix2 = int(round(x2 - inset_x))
+    iy2 = int(round(y2 - inset_y))
+    # Clip to image
+    ix1 = max(0, min(W, ix1))
+    iy1 = max(0, min(H, iy1))
+    ix2 = max(0, min(W, ix2))
+    iy2 = max(0, min(H, iy2))
+    if ix2 <= ix1 or iy2 <= iy1:
+        # Inner region collapsed (e.g., a tiny bbox with large margin) —
+        # fall back to the FULL bbox check so we don't silently return False
+        # for legitimate small symbols on the line.
+        ix1 = max(0, int(x1))
+        iy1 = max(0, int(y1))
+        ix2 = min(W, int(x2) + 1)
+        iy2 = min(H, int(y2) + 1)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return False
+    patch = gt_mask[iy1:iy2, ix1:ix2]
+    return bool(patch.any())
 
 
 def main() -> int:
@@ -82,10 +126,12 @@ def main() -> int:
     parser.add_argument("--overlay",     default="configs/train_v2b_6k.yaml")
     parser.add_argument("--cache-dir",   default="results/symbols_cache")
     parser.add_argument("--splits",      nargs="+", default=["train", "valid", "test"])
-    parser.add_argument("--d-near",      type=int, default=10,
-                        help="Pixel distance for bbox-overlap with GT. Default 10 "
-                             "is meaningfully tighter than the old 30 because we "
-                             "no longer need to compensate for center bias.")
+    parser.add_argument("--center-margin", type=float, default=0.30,
+                        help="Fraction of each bbox side to crop OFF when "
+                             "checking GT overlap. 0.30 → inner region is the "
+                             "central 40%% × 40%% of the bbox. Same fraction "
+                             "works for symbols of any size — that's the point "
+                             "of using a relative threshold.")
     args = parser.parse_args()
 
     cfg = merge_configs(yaml.safe_load(open(args.base_config)),
@@ -149,12 +195,11 @@ def main() -> int:
                     s["near_gt"] = None
                 jp.write_text(json.dumps(data))
                 continue
-            dist = _near_gt_lookup(gt)
 
             for s in data["symbols"]:
                 old = s.get("near_gt")
-                new = _bbox_near_gt(
-                    dist, s["x1"], s["y1"], s["x2"], s["y2"], args.d_near,
+                new = _bbox_near_gt_inner(
+                    gt, s["x1"], s["y1"], s["x2"], s["y2"], args.center_margin,
                 )
                 s["near_gt"] = bool(new)
                 if old is None or bool(old) != bool(new):
