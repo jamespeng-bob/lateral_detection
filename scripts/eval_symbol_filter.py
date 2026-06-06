@@ -198,6 +198,10 @@ def main() -> int:
                              "from being dropped (they're long enough to be real "
                              "laterals, not callout fragments). Default 150.")
     parser.add_argument("--max-long-side",   type=int, default=1800)
+    parser.add_argument("--max-images",      type=int, default=0,
+                        help="0 = all images in the split; otherwise process at "
+                             "most this many (in image-id sort order). Use to "
+                             "skip slow trailing images while iterating.")
     args = parser.parse_args()
 
     cfg = merge_configs(yaml.safe_load(open(args.base_config)),
@@ -258,8 +262,11 @@ def main() -> int:
             continue
         out_split = out_dir / split; out_split.mkdir(parents=True, exist_ok=True)
         images, chords_by_image = load_split(split_dir, category_id=lateral_cid)
-        print(f"\n=== split: {split} ({len(images)} images) ===")
-        for image_id, record in tqdm(sorted(images.items()), desc=split):
+        items = sorted(images.items())
+        if args.max_images > 0:
+            items = items[: args.max_images]
+        print(f"\n=== split: {split} ({len(items)} images of {len(images)}) ===")
+        for image_id, record in tqdm(items, desc=split):
             img_path = record.path
             if not img_path.is_file():
                 continue
