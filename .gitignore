@@ -40,3 +40,5 @@ credentials/
 .env
 .env.*
 
+# Ignore local Cursor/VS Code workspace files
+*.code-workspace
